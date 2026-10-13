@@ -1951,6 +1951,9 @@ Item {
     lines.push("  end")
     if (g.hotkey) lines.push("  pcall(hl.bind, " + root.luaString(g.hotkey) + ", hl.dsp.exec_cmd(" + root.luaString(shellCall + "hide stefans.omacast") + "), { description = \"Close Omacast\" })")
     lines.push("  pcall(hl.bind, \"SUPER + ESCAPE\", hl.dsp.submap(\"reset\"), { description = \"Leave Omacast submap\" })")
+    // Keys that should keep working while Omacast is open (e.g. screenshots)
+    // can be bound from bindings.lua by defining omacast_submap_binds().
+    lines.push("  if type(omacast_submap_binds) == \"function\" then pcall(omacast_submap_binds) end")
     lines.push("end)")
     lines.push("bind(" + root.luaString(g.menuHotkey || "") + ", \"Omarchy menu\", \"omarchy-menu toggle root\")")
     lines.push("bind(" + root.luaString(n.hotkey || "") + ", \"Omacast Notes\", " + root.luaString(shellCall + "call stefans.omacast toggleNotes ''") + ")")
