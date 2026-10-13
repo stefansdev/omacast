@@ -63,8 +63,14 @@ Item {
     && !(root.config.general.showFavoritesInCompact !== false && root.favoriteRows().length > 0)
   readonly property int cardWidth: Math.min(Style.space(root.wideMode ? 980 : 780) * (root.wideMode ? 1 : root.ts), panel.width - Style.space(40))
   readonly property int fullHeight: Math.min(Style.space(root.wideMode ? 640 : 520) * (root.wideMode ? 1 : Math.min(root.ts, 1.15)), panel.height - Style.space(80))
-  readonly property int cardHeight: root.compact ? root.headerHeight + 2 : root.fullHeight
-  readonly property int cardRadius: Style.space(14)
+  readonly property int cardHeight: root.compact ? root.headerHeight + Border.top(root.borderSpec) + Border.bottom(root.borderSpec) : root.fullHeight
+  readonly property int cardRadius: Style.cornerRadius
+  // The theme's menu border (colour and width). Surfaces keep its widths as
+  // insets but draw it themselves as a fading GradientBorder.
+  readonly property var borderSpec: Border.surfaceSpec("menu", "border", Color.menu.border, Math.max(1, Style.space(2)))
+  readonly property var insetSpec: ({ color: "transparent", widths: root.borderSpec.widths, gradient: null })
+  readonly property color borderColor: Border.color(root.borderSpec)
+  readonly property real borderWidth: Border.top(root.borderSpec)
   readonly property int headerHeight: Math.round(Style.space(58) * Math.min(root.ts, 1.15))
   readonly property int footerHeight: Style.space(42)
   readonly property int rowHeight: Math.round(Style.space(44) * root.ts)
@@ -1934,7 +1940,6 @@ Item {
       "-- Floating notes: a pinned floating window above everything.",
       "local notes = { title = \"^Omacast Notes$\" }",
       "pcall(hl.window_rule, { match = notes, float = true, pin = true, size = { 460, 420 }, move = { \"(monitor_w-window_w-40)\", \"(monitor_h*0.06)\" } })",
-      "pcall(hl.window_rule, { match = notes, tag = \"-default-opacity\", opacity = \"1 1\", border_size = 0 })",
       ""
     ]
     lines.push("bind(" + root.luaString(g.hotkey || "") + ", \"Omacast\", " + root.luaString(shellCall + "toggle stefans.omacast '{}'") + ")")
@@ -2139,7 +2144,9 @@ Item {
       transformOrigin: Item.Top
     }
 
-    Rectangle {
+    // Omarchy's own surface: the theme's menu border (colour, width, gradient)
+    // and Hyprland's corner rounding, exactly like the Omarchy menu.
+    BorderSurface {
       id: card
       width: root.cardWidth
       height: root.cardHeight
@@ -2147,18 +2154,29 @@ Item {
       anchors.horizontalCenter: parent.horizontalCenter
       y: Math.max(Style.space(20), Math.round(panel.height * 0.18))
       color: root.background
-      border.width: Style.spacing.hairline
-      border.color: Util.alpha(root.foreground, 0.13)
+      borderSpec: root.insetSpec
       opacity: panel.openProgress
       scale: 0.97 + 0.03 * panel.openProgress
       transformOrigin: Item.Top
 
       MouseArea { anchors.fill: parent; onClicked: input.forceActiveFocus() }
 
+      GradientBorder {
+        anchors.fill: parent
+        z: 100
+        radius: card.radius
+        thickness: root.borderWidth
+        color: root.borderColor
+      }
+
+
       Column {
         id: layout
         anchors.fill: parent
-        anchors.margins: card.border.width
+        anchors.topMargin: card.borderTop
+        anchors.rightMargin: card.borderRight
+        anchors.bottomMargin: card.borderBottom
+        anchors.leftMargin: card.borderLeft
 
         // ---------------------------------------------------- search bar
         Item {
@@ -2319,7 +2337,7 @@ Item {
           id: content
           visible: !root.compact
           width: parent.width
-          height: card.height - root.headerHeight - root.footerHeight - Style.spacing.hairline - card.border.width * 2
+          height: card.height - root.headerHeight - root.footerHeight - Style.spacing.hairline - card.borderTop - card.borderBottom
 
           // List (search + clipboard)
           ListView {
@@ -3070,8 +3088,8 @@ Item {
           width: parent.width
           height: root.footerHeight
           color: Util.alpha(root.foreground, 0.035)
-          bottomLeftRadius: root.cardRadius - card.border.width
-          bottomRightRadius: root.cardRadius - card.border.width
+          bottomLeftRadius: Math.max(0, root.cardRadius - card.borderBottom)
+          bottomRightRadius: Math.max(0, root.cardRadius - card.borderBottom)
 
           Rectangle {
             anchors.top: parent.top
@@ -3168,7 +3186,7 @@ Item {
       }
 
       // ------------------------------------------------- action panel
-      Rectangle {
+      BorderSurface {
         id: actionPanel
         visible: root.actionsOpen && root.selectedActions.length > 0
         z: 30
@@ -3178,10 +3196,18 @@ Item {
         anchors.rightMargin: Style.space(10)
         anchors.bottom: parent.bottom
         anchors.bottomMargin: root.footerHeight + Style.space(4)
-        radius: Style.space(12)
+        radius: Math.max(0, root.cardRadius - Style.space(2))
         color: Qt.lighter(root.background, 1.25)
-        border.width: Style.spacing.hairline
-        border.color: Util.alpha(root.foreground, 0.16)
+        borderSpec: root.insetSpec
+
+        GradientBorder {
+          anchors.fill: parent
+          z: 100
+          radius: parent.radius
+          thickness: root.borderWidth
+          color: root.borderColor
+        }
+
 
         RectangularShadow {
           z: -1

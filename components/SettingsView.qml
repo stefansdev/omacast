@@ -211,7 +211,7 @@ Item {
         }
         SettingRow {
           title: "Theme"
-          description: "Omacast follows your Omarchy theme. Change it with Omarchy › Style › Theme."
+          description: "Colours, borders and corner rounding follow your Omarchy theme. Change it with Omarchy › Style › Theme."
         }
       }
 

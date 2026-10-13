@@ -327,13 +327,15 @@ Item {
     implicitHeight: notes.geo.h
     color: "transparent"
 
+    // A regular window: Hyprland draws Omarchy's border, rounding and
+    // opacity around it, like every other app.
     Rectangle {
       id: card
       anchors.fill: parent
-      radius: 12
+      radius: 0
       color: notes.background
-      border.width: 1
-      border.color: Util.alpha(notes.foreground, 0.13)
+      border.width: 0
+
 
       // ------------------------------------------------------- title bar
       Item {
@@ -419,8 +421,8 @@ Item {
         anchors.margins: 1
         height: 36
         color: Util.alpha(notes.foreground, 0.035)
-        bottomLeftRadius: 11
-        bottomRightRadius: 11
+        bottomLeftRadius: 0
+        bottomRightRadius: 0
 
         Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: Util.alpha(notes.foreground, 0.07) }
 
