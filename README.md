@@ -53,17 +53,27 @@ question with `?` from Search to jump straight in.
 ## Install
 
 ```bash
-ln -sfn ~/Work/omarchy/omacast ~/.config/omarchy/plugins/stefans.omacast
-omarchy plugin enable stefans.omacast
+omarchy pkg add libqalculate fd wtype wl-clipboard jq curl
+omarchy plugin add https://github.com/stefansdev/omacast.git --enable --yes
 ~/.config/omarchy/plugins/stefans.omacast/bin/install
 ```
 
-The installer backs up `~/.config/hypr/bindings.lua`, binds Super+Space
-(moving the Omarchy menu to Super+Alt+Space), links `omacast` into
-`~/.local/bin` and seeds `~/.config/omacast/config.jsonc`.
+The first command installs the requirements (most are already on Omarchy).
+The second clones the plugin into `~/.config/omarchy/plugins/stefans.omacast`
+and enables it. The installer backs up `~/.config/hypr/bindings.lua`, binds
+Super+Space (moving the Omarchy menu to Super+Alt+Space), links `omacast` into
+`~/.local/bin` and seeds `~/.config/omacast/config.jsonc`. Running it again is
+safe.
 
-Requirements: `qalc`, `fd`, `wtype`, `wl-clipboard`, `jq`, `curl`, plus the
-`claude` CLI for Quick AI.
+Quick AI also needs the [Claude Code](https://claude.com/claude-code) CLI,
+signed in. Without it, the rest of Omacast works as usual.
+
+## Update
+
+```bash
+omarchy plugin update stefans.omacast --yes
+omarchy restart shell
+```
 
 ## Configure
 
@@ -87,6 +97,14 @@ Row ids look like `window.left-half`, `system.lock`, `custom.<name-slug>`,
 `snippet.<keyword>`, `omarchy.<menu id>` and `app.<desktop id>`.
 
 ## Develop
+
+To work from a local checkout instead, link it into place:
+
+```bash
+git clone git@github.com:stefansdev/omacast.git ~/Work/omarchy/omacast
+ln -sfn ~/Work/omarchy/omacast ~/.config/omarchy/plugins/stefans.omacast
+omarchy plugin enable stefans.omacast
+```
 
 Omacast is a `keepLoaded` plugin, so code changes need `omarchy restart shell`.
 Config changes apply live.
