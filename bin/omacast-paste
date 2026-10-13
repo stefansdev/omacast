@@ -1,50 +1,76 @@
 #!/bin/bash
 
-# Expand Omacast placeholders in a text, then paste it into the focused app
-# (or only copy it with --copy-only).
+# Insert text into the focused app.
 #
-#   omacast-paste [--copy-only] <text>
+#   omacast-paste [--copy-only] [--delete N] [--cursor-back N] [--expand] <text>
 #
-# Placeholders: {clipboard} {date} {time} {datetime} {weekday} {uuid} {user}
+#   --copy-only     only put the text on the clipboard
+#   --delete N      press Backspace N times first (removes a typed keyword)
+#   --cursor-back N press Left N times afterwards (lands on {cursor})
+#   --expand        expand the simple {clipboard} {date} {time} {datetime}
+#                   {weekday} {uuid} {user} placeholders here (Omacast itself
+#                   expands snippets before calling this)
+#
+# Short single-line text is typed directly so the clipboard is untouched;
+# longer text is pasted and the previous text clipboard is restored.
 
 set -uo pipefail
 
 copy_only=0
-if [[ ${1:-} == "--copy-only" ]]; then
-  copy_only=1
-  shift
-fi
+delete=0
+cursor_back=0
+expand=0
+while (( $# > 1 )); do
+  case "$1" in
+  --copy-only) copy_only=1; shift ;;
+  --delete) delete="$2"; shift 2 ;;
+  --cursor-back) cursor_back="$2"; shift 2 ;;
+  --expand) expand=1; shift ;;
+  *) break ;;
+  esac
+done
 
 text="${1:-}"
 [[ -n $text ]] || exit 0
 
-expand() {
-  local value="$1"
-  if [[ $value == *"{clipboard}"* ]]; then
-    local clip
+if (( expand )); then
+  if [[ $text == *"{clipboard}"* ]]; then
     clip=$(wl-paste --no-newline 2>/dev/null || true)
-    value=${value//\{clipboard\}/$clip}
+    text=${text//\{clipboard\}/$clip}
   fi
-  value=${value//\{date\}/$(date +%F)}
-  value=${value//\{time\}/$(date +%H:%M)}
-  value=${value//\{datetime\}/$(date '+%F %H:%M')}
-  value=${value//\{weekday\}/$(date +%A)}
-  value=${value//\{user\}/${USER:-$(id -un)}}
-  if [[ $value == *"{uuid}"* ]]; then
-    value=${value//\{uuid\}/$(cat /proc/sys/kernel/random/uuid)}
-  fi
-  printf '%s' "$value"
-}
-
-expanded=$(expand "$text")
+  text=${text//\{date\}/$(date +%F)}
+  text=${text//\{time\}/$(date +%H:%M)}
+  text=${text//\{datetime\}/$(date '+%F %H:%M')}
+  text=${text//\{weekday\}/$(date +%A)}
+  text=${text//\{user\}/${USER:-$(id -un)}}
+  [[ $text == *"{uuid}"* ]] && text=${text//\{uuid\}/$(cat /proc/sys/kernel/random/uuid)}
+fi
 
 if (( copy_only )); then
-  printf '%s' "$expanded" | wl-copy --type text/plain
+  printf '%s' "$text" | wl-copy --type text/plain
   exit 0
 fi
 
-# Give the launcher time to close and focus to return to the previous window.
-sleep 0.12
-printf '%s' "$expanded" | wl-copy --type text/plain
-sleep 0.08
-wtype -M shift -k Insert -m shift 2>/dev/null || true
+# Let the launcher close and focus return to the previous window.
+sleep 0.15
+
+[[ $delete =~ ^[0-9]+$ ]] && (( delete > 0 )) && wtype $(printf -- '-k BackSpace %.0s' $(seq "$delete")) 2>/dev/null
+
+if (( ${#text} <= 100 )) && [[ $text != *$'\n'* ]]; then
+  wtype -- "$text" 2>/dev/null
+else
+  previous=$(timeout 1 wl-paste --no-newline --type text 2>/dev/null; printf x)
+  previous=${previous%x}
+  printf '%s' "$text" | wl-copy --type text/plain --sensitive
+  sleep 0.08
+  wtype -M shift -k Insert -m shift 2>/dev/null
+  sleep 0.35
+  if [[ -n $previous ]]; then
+    printf '%s' "$previous" | wl-copy --type text/plain --sensitive
+  fi
+fi
+
+if [[ $cursor_back =~ ^[0-9]+$ ]] && (( cursor_back > 0 )); then
+  sleep 0.05
+  wtype $(printf -- '-k Left %.0s' $(seq "$cursor_back")) 2>/dev/null
+fi

@@ -11,10 +11,12 @@ set -uo pipefail
 
 model="haiku"
 resume=""
+instructions=""
 while (( $# > 1 )); do
   case "$1" in
   --model) model="$2"; shift 2 ;;
   --resume) resume="$2"; shift 2 ;;
+  --instructions) instructions="$2"; shift 2 ;;
   *) break ;;
   esac
 done
@@ -46,7 +48,7 @@ args=(
   --output-format stream-json
   --include-partial-messages
   --verbose
-  --append-system-prompt "You are answering inside a desktop launcher. Be concise and direct. Use short Markdown when it helps; no preamble."
+  --append-system-prompt "You are answering inside a desktop launcher. Be concise and direct. Use short Markdown when it helps; no preamble.${instructions:+ $instructions}"
 )
 [[ -n $resume ]] && args+=(--resume "$resume")
 

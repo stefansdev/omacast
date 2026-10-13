@@ -1,7 +1,11 @@
 #!/bin/bash
 
-# Bind Omacast to Super+Space (moving the Omarchy menu to Super+Alt+Space) and
-# put the `omacast` helper on PATH. Safe to run again.
+# Hook Omacast into Hyprland and put the `omacast` helper on PATH. Safe to run
+# again; it also upgrades the block written by earlier versions.
+#
+# The bindings.lua block only loads ~/.config/omacast/hyprland.lua, which
+# Omacast writes from its settings (hotkeys, per-command hotkeys, snippet
+# keyword expansion).
 
 set -euo pipefail
 
@@ -10,48 +14,78 @@ start_marker="-- omacast:start"
 end_marker="-- omacast:end"
 bindings_file="$HOME/.config/hypr/bindings.lua"
 plugin_dir="$HOME/.config/omarchy/plugins/$plugin_id"
+config_dir="$HOME/.config/omacast"
 
 fail() {
   echo "install: $*" >&2
   exit 1
 }
 
-for command in omarchy-shell hyprctl jq qalc fd wtype wl-copy; do
+for command in omarchy-shell hyprctl jq qalc fd rg wtype wl-copy; do
   command -v "$command" >/dev/null 2>&1 || fail "$command is required; no configuration was changed"
 done
 
 [[ -f "$plugin_dir/manifest.json" ]] || fail "install the plugin at $plugin_dir first"
 [[ -f "$bindings_file" ]] || fail "$bindings_file does not exist"
 
-mkdir -p "$HOME/.local/bin"
+mkdir -p "$HOME/.local/bin" "$config_dir"
 ln -sfn "$plugin_dir/bin/omacast" "$HOME/.local/bin/omacast"
 
-if [[ ! -f "$HOME/.config/omacast/config.jsonc" ]]; then
-  mkdir -p "$HOME/.config/omacast"
-  cp "$plugin_dir/config.default.jsonc" "$HOME/.config/omacast/config.jsonc"
+if [[ ! -f "$config_dir/config.jsonc" ]]; then
+  printf '// Omacast settings. Edited by Omacast Settings; unset keys use the defaults.\n{}\n' >"$config_dir/config.jsonc"
 fi
+
+# Ask the running plugin to write hyprland.lua from the current settings.
+omarchy-shell shell call "$plugin_id" writeHyprland '' >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -s "$config_dir/hyprland.lua" ]] && break
+  sleep 0.2
+done
+[[ -s "$config_dir/hyprland.lua" ]] || fail "Omacast did not write $config_dir/hyprland.lua; is the plugin enabled? (omarchy plugin enable $plugin_id)"
+
+block=$(cat <<'LUA'
+-- omacast:start
+-- Omacast hotkeys and snippet expansion; change them in Omacast Settings.
+do
+  local path = os.getenv("HOME") .. "/.config/omacast/hyprland.lua"
+  local file = io.open(path, "r")
+  if file then
+    file:close()
+    local ok, err = pcall(dofile, path)
+    if not ok then io.stderr:write("omacast: " .. tostring(err) .. "\n") end
+  end
+end
+-- omacast:end
+LUA
+)
 
 start_count=$(grep -Fxc -- "$start_marker" "$bindings_file" || true)
 end_count=$(grep -Fxc -- "$end_marker" "$bindings_file" || true)
-if (( start_count == 1 && end_count == 1 )); then
-  echo "Omacast is already bound."
+(( start_count == end_count && start_count <= 1 )) || fail "found an incomplete omacast marker block in $bindings_file"
+
+current=""
+(( start_count == 1 )) && current=$(sed -n "/^$start_marker\$/,/^$end_marker\$/p" "$bindings_file")
+if [[ $current == "$block" ]]; then
+  hyprctl reload >/dev/null 2>&1 || true
+  echo "Omacast is already installed; hotkeys reloaded."
   exit 0
 fi
-(( start_count == 0 && end_count == 0 )) || fail "found an incomplete omacast marker block in $bindings_file"
 
 backup="$bindings_file.omacast.bak.$(date -u +%Y%m%d%H%M%S)"
 cp -p -- "$bindings_file" "$backup"
 
-cat >>"$bindings_file" <<'LUA'
-
--- omacast:start
--- Omacast launcher on Super+Space; the Omarchy menu moves to Super+Alt+Space.
-hl.unbind("SUPER + SPACE")
-hl.unbind("SUPER + ALT + SPACE")
-o.bind("SUPER + SPACE", "Omacast", "omarchy-shell shell toggle stefans.omacast '{}'")
-o.bind("SUPER + ALT + SPACE", "Omarchy menu", "omarchy-menu toggle root")
--- omacast:end
-LUA
+if (( start_count == 1 )); then
+  tmp=$(mktemp)
+  BLOCK="$block" awk -v start="$start_marker" -v end="$end_marker" '
+    $0 == start { print ENVIRON["BLOCK"]; skipping = 1; next }
+    skipping && $0 == end { skipping = 0; next }
+    !skipping { print }
+  ' "$bindings_file" >"$tmp"
+  cat "$tmp" >"$bindings_file"
+  rm -f "$tmp"
+else
+  printf '\n%s\n' "$block" >>"$bindings_file"
+fi
 
 hyprctl reload >/dev/null 2>&1 || true
 sleep 0.5
@@ -59,7 +93,8 @@ errors=$(hyprctl configerrors 2>/dev/null | grep -v '^\s*$' || true)
 if [[ -n $errors && $errors != *"no errors"* ]]; then
   cp -p -- "$backup" "$bindings_file"
   hyprctl reload >/dev/null 2>&1 || true
-  fail "Hyprland reported config errors, restored $bindings_file:\n$errors"
+  fail "Hyprland reported config errors, restored $bindings_file:
+$errors"
 fi
 
-echo "Omacast bound to Super+Space (Omarchy menu: Super+Alt+Space). Backup: $backup"
+echo "Omacast installed. Hotkeys come from Omacast Settings (Ctrl+, in the launcher). Backup: $backup"

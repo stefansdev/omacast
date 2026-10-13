@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "stefans.omacast",
   "name": "Omacast",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "stefans",
   "description": "A Raycast-style launcher: apps, windows, commands, calculator, clipboard, emoji, files, notes and quick AI",
   "kinds": ["menu"],

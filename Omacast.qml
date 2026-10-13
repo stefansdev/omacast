@@ -3,9 +3,12 @@ import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import Quickshell.Hyprland
 import qs.Commons
 import qs.Ui
 import "lib/Engine.js" as Engine
+import "lib/Snippets.js" as Snippets
+import "components"
 import "file:///usr/share/omarchy/shell/plugins/menu/MenuModel.js" as MenuModel
 import "file:///usr/share/omarchy/shell/services/AppSearch.js" as AppSearch
 
@@ -30,6 +33,9 @@ Item {
   property var configuredHiddenIds: ({})
   readonly property string home: Quickshell.env("HOME")
   readonly property string configPath: home + "/.config/omacast/config.jsonc"
+  readonly property string snippetsPath: home + "/.config/omacast/snippets.json"
+  readonly property string hyprPath: home + "/.config/omacast/hyprland.lua"
+  readonly property string version: "0.2.0"
   readonly property string stateDir: home + "/.local/state/omacast"
 
   function bin(name) {
@@ -45,22 +51,34 @@ Item {
   readonly property color accent: Color.accent
   readonly property color faint: Util.alpha(foreground, 0.08)
   readonly property color hover: Util.alpha(foreground, 0.085)
-  readonly property int cardWidth: Math.min(Style.space(780), panel.width - Style.space(40))
-  readonly property int cardHeight: Math.min(Style.space(520), panel.height - Style.space(80))
+  // Text size setting: Default / Large / Larger.
+  readonly property real ts: {
+    var size = (root.config.general && root.config.general.textSize) || "default"
+    return size === "larger" ? 1.25 : (size === "large" ? 1.12 : 1.0)
+  }
+  function fs(px) { return Math.round(px * root.ts) }
+  readonly property bool wideMode: root.mode === "settings" || root.mode === "snippet-edit"
+  readonly property bool compact: ((root.config.general && root.config.general.windowMode) === "compact")
+    && root.mode === "search" && root.query.length === 0
+    && !(root.config.general.showFavoritesInCompact !== false && root.favoriteRows().length > 0)
+  readonly property int cardWidth: Math.min(Style.space(root.wideMode ? 980 : 780) * (root.wideMode ? 1 : root.ts), panel.width - Style.space(40))
+  readonly property int fullHeight: Math.min(Style.space(root.wideMode ? 640 : 520) * (root.wideMode ? 1 : Math.min(root.ts, 1.15)), panel.height - Style.space(80))
+  readonly property int cardHeight: root.compact ? root.headerHeight + 2 : root.fullHeight
   readonly property int cardRadius: Style.space(14)
-  readonly property int headerHeight: Style.space(58)
+  readonly property int headerHeight: Math.round(Style.space(58) * Math.min(root.ts, 1.15))
   readonly property int footerHeight: Style.space(42)
-  readonly property int rowHeight: Style.space(44)
+  readonly property int rowHeight: Math.round(Style.space(44) * root.ts)
   readonly property int sectionHeight: Style.space(30)
   readonly property int calcHeight: Style.space(88)
   readonly property int emojiColumns: 10
 
   // ------------------------------------------------------------------ state
   property bool opened: false
-  property string mode: "search" // search | clipboard | emoji | ai | detail
+  property string mode: "search" // search | clipboard | snippets | emoji | ai | detail | settings | snippet-edit | snippet-args
   readonly property var tabs: [
     { mode: "search", label: "Search", glyph: "" },
     { mode: "clipboard", label: "Clipboard", glyph: "󰅌" },
+    { mode: "snippets", label: "Snippets", glyph: "󰅪" },
     { mode: "emoji", label: "Emoji", glyph: "󰞅" },
     { mode: "ai", label: "AI", glyph: "󰚩" }
   ]
@@ -103,6 +121,20 @@ Item {
   property var menuWhen: ({})
   property var menuChecked: ({})
 
+  // Snippets live in their own file so the settings UI can rewrite config
+  // without touching them.
+  property var snippets: []
+  property bool snippetsLoaded: false
+  property var snippetDraft: null       // { index, name, keyword, text }
+  property var snippetArgs: []          // [{ name, value, options }]
+  property var snippetPending: null     // { snippet, delete }
+  property bool recording: false
+  property var hyprBinds: ({})      // lowercased description → "SUPER + SHIFT + B"
+  property var defaultApps: ({})    // browser / terminal / files → desktop id
+  property real closedAt: 0
+  property string lastMode: "search"
+  property string lastQuery: ""
+
   property var conversation: []
   property string aiSession: ""
   property bool aiBusy: false
@@ -137,18 +169,28 @@ Item {
 
     root.actionsOpen = false
     root.pendingConfirm = null
-    root.calc = null
-    root.fileRows = []
-    root.fileRowsQuery = ""
-    root.mode = "search"
-    root.query = ""
-    input.text = ""
+
+    // Pop to root: keep the last view and query for a while after closing.
+    var keep = (root.config.general && root.config.general.popToRoot) || 0
+    var elapsed = (Date.now() - root.closedAt) / 1000
+    var restore = (keep < 0 || (keep > 0 && elapsed < keep)) && !payload.mode && !payload.query
+    if (!restore || root.lastMode === "snippet-args" || root.lastMode === "snippet-edit") {
+      root.calc = null
+      root.fileRows = []
+      root.fileRowsQuery = ""
+      root.mode = "search"
+      root.query = ""
+      input.text = ""
+    }
+    root.pickScreen()
     root.opened = true
+    root.enterLauncherSubmap(true)
+    bindsProc.running = true
 
     root.buildApps()
     clientsProc.running = false
     clientsProc.running = true
-    notesProc.load()
+    notesWin.refreshList()
 
     var requested = String(payload.mode || "search")
     if (requested !== "search") root.setMode(requested)
@@ -164,9 +206,42 @@ Item {
 
   function close() {
     // A running AI answer keeps streaming; it is there when you come back.
+    if (root.recording) root.setRecording(false)
+    if (root.opened) root.enterLauncherSubmap(false)
     root.opened = false
     root.actionsOpen = false
     root.pendingConfirm = null
+    root.closedAt = Date.now()
+    root.lastMode = root.mode
+  }
+
+  // Show on: focused monitor (default), the monitor under the mouse, or primary.
+  property var targetScreen: null
+  function pickScreen() {
+    var where = (root.config.general && root.config.general.showOn) || "focused"
+    var screens = Quickshell.screens || []
+    if (screens.length === 0) return
+    if (where === "primary") { root.targetScreen = screens[0]; return }
+    var name = ""
+    if (where === "cursor") {
+      cursorMonitorProc.running = true
+      return
+    }
+    var focused = Hyprland.focusedMonitor
+    name = focused ? focused.name : ""
+    root.targetScreen = screens.filter(function(s) { return s.name === name })[0] || screens[0]
+  }
+
+  Process {
+    id: cursorMonitorProc
+    command: ["bash", "-c", "read -r x y < <(hyprctl cursorpos | tr -d ','); hyprctl monitors -j | jq -r --argjson x \"$x\" --argjson y \"$y\" 'first(.[] | select($x >= .x and $x < .x + .width / .scale and $y >= .y and $y < .y + .height / .scale)) | .name'"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var name = String(this.text || "").trim()
+        var screens = Quickshell.screens || []
+        root.targetScreen = screens.filter(function(s) { return s.name === name })[0] || screens[0]
+      }
+    }
   }
 
   function toggle() {
@@ -192,10 +267,208 @@ Item {
 
   function ping() { return "ok" }
 
+  // Used by bin/install: write ~/.config/omacast/hyprland.lua now.
+  function writeHyprland() {
+    var lua = root.hyprLua()
+    root.lastHyprLua = lua
+    hyprFile.setText(lua)
+    return "ok"
+  }
+
+  function settings(section) {
+    root.open("{}")
+    root.setMode("settings")
+    if (section) settingsView.section = section
+    return "ok"
+  }
+
   // -------------------------------------------------------------- catalog
-  function catalog() {
+  function rawCatalog() {
     return root.appRows.concat(root.windowRows, root.omarchyRows, root.configRows,
       root.noteRows, root.layoutRows, root.systemRows)
+  }
+
+  // The searchable catalog: hidden commands removed, aliases added as
+  // keywords, and the shared Favorites / Configure actions appended.
+  function catalog() {
+    var rows = root.rawCatalog()
+    var overrides = root.config.overrides || {}
+    var out = []
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      var ov = overrides[row.id]
+      if (ov && ov.disabled) continue
+      out.push(root.decorate(row, ov))
+    }
+    return out
+  }
+
+  function decorate(row, ov) {
+    if (row.kind === "window" || row.kind === "file" || row.kind === "clip") return row
+    var copy = {}
+    for (var k in row) copy[k] = row[k]
+    if (ov && ov.alias) {
+      copy.alias = ov.alias
+      copy.keywords = (row.keywords || []).concat([ov.alias])
+    }
+    // Favorites sit right after the primary and secondary actions, like Raycast.
+    var base = row.actions || []
+    var fav = root.isFavorite(row.id)
+    var favActions = [{ title: fav ? "Remove from Favorites" : "Add to Favorites", op: "favorite", arg: row.id, key: "Ctrl ⇧ F" }]
+    if (fav) {
+      favActions.push({ title: "Move Up in Favorites", op: "favorite-move", arg: row.id, arg2: -1, key: "Ctrl Alt ↑" })
+      favActions.push({ title: "Move Down in Favorites", op: "favorite-move", arg: row.id, arg2: 1, key: "Ctrl Alt ↓" })
+    }
+    copy.actions = base.slice(0, 2).concat(favActions, base.slice(2), [
+      { title: "Configure Alias & Hotkey…", op: "configure", arg: row.title }
+    ])
+    return copy
+  }
+
+  // ---------------------------------------------------- shortcut keycaps
+  // A row's hotkey: Super+N for the first nine favorites, then one set in
+  // Omacast, then (apps only) a Hyprland binding whose description names the
+  // app — your "Ghostty" binding, or Omarchy's Browser / Terminal / File
+  // manager bindings for the default apps.
+  function hotkeyFor(row) {
+    if (!row) return ""
+    if (row.favIndex) return "SUPER + " + row.favIndex
+    var ov = (root.config.overrides || {})[row.id]
+    if (ov && ov.hotkey) return ov.hotkey
+    var title = String(row.title || "").toLowerCase()
+    if (row.kind === "app") {
+      var base = String(row.appId || "").replace(/\.desktop$/, "")
+      if (base && base === root.defaultApps.browser && root.hyprBinds["browser"]) return root.hyprBinds["browser"]
+      if (base && base === root.defaultApps.terminal && root.hyprBinds["terminal"]) return root.hyprBinds["terminal"]
+      if (base && base === root.defaultApps.files && root.hyprBinds["file manager"]) return root.hyprBinds["file manager"]
+      return root.hyprBinds[title] || root.hyprBinds[title.replace(/ browser$/, "")] || ""
+    }
+    // Commands only show hotkeys set in Omacast: matching Hyprland bindings by
+    // name gives false hits (Omarchy's "Grok" default-agent row vs. the Grok app).
+    return ""
+  }
+
+  function keyParts(keys) {
+    return String(keys || "").split("+").map(function(p) { return p.trim() }).filter(function(p) { return p.length > 0 })
+  }
+
+  function prettyKey(part) {
+    var p = String(part).toUpperCase()
+    var map = { "SUPER": "Super", "CTRL": "Ctrl", "CONTROL": "Ctrl", "ALT": "Alt", "SHIFT": "Shift",
+      "SPACE": "Space", "RETURN": "↵", "ENTER": "↵", "ESCAPE": "Esc", "PERIOD": ".", "COMMA": ",", "SLASH": "/",
+      "SEMICOLON": ";", "MINUS": "-", "EQUAL": "=", "BRACKETLEFT": "[", "BRACKETRIGHT": "]", "BACKSLASH": "\\",
+      "GRAVE": "`", "APOSTROPHE": "'", "LEFT": "←", "RIGHT": "→", "UP": "↑", "DOWN": "↓", "TAB": "Tab",
+      "DELETE": "Del", "BACKSPACE": "⌫", "PRINT": "Print", "PRIOR": "PgUp", "NEXT": "PgDn" }
+    return map[p] || (p.length === 1 ? p : String(part).charAt(0).toUpperCase() + String(part).substring(1).toLowerCase())
+  }
+
+  function bindKeys(b) {
+    var mods = []
+    var m = b.modmask || 0
+    if (m & 64) mods.push("SUPER")
+    if (m & 4) mods.push("CTRL")
+    if (m & 8) mods.push("ALT")
+    if (m & 1) mods.push("SHIFT")
+    var key = String(b.key || "")
+    var code = key.match(/^code:(\d+)$/)
+    if (code) {
+      var digits = { "10": "1", "11": "2", "12": "3", "13": "4", "14": "5", "15": "6", "16": "7", "17": "8", "18": "9", "19": "0", "20": "MINUS", "21": "EQUAL", "49": "GRAVE", "59": "COMMA", "60": "PERIOD", "61": "SLASH" }
+      key = digits[code[1]] || ""
+    }
+    if (!key || key.indexOf("mouse") === 0) return ""
+    return mods.concat([key.toUpperCase()]).join(" + ")
+  }
+
+  Process {
+    id: bindsProc
+    command: ["bash", "-c", "hyprctl binds -j; echo '@@OMACAST@@'; xdg-settings get default-web-browser 2>/dev/null; grep -v '^#' \"$HOME/.config/xdg-terminals.list\" 2>/dev/null | head -1; xdg-mime query default inode/directory 2>/dev/null"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var parts = String(this.text || "").split("@@OMACAST@@")
+        var binds = []
+        try { binds = JSON.parse(parts[0]) } catch (e) { binds = [] }
+        var map = ({})
+        var rank = ({})
+        for (var i = 0; i < binds.length; i++) {
+          var b = binds[i]
+          if (b.submap || !b.description || b.release || b.mouse) continue
+          var keys = root.bindKeys(b)
+          if (!keys) continue
+          var d = String(b.description).toLowerCase()
+          // Later definitions (your own bindings) win over Omarchy's defaults.
+          var order = Number(b.arg) || i
+          if (rank[d] === undefined || order >= rank[d]) { map[d] = keys; rank[d] = order }
+        }
+        root.hyprBinds = map
+        var lines = (parts[1] || "").trim().split("\n")
+        var strip = function(v) { return String(v || "").trim().replace(/\.desktop$/, "") }
+        root.defaultApps = { browser: strip(lines[0]), terminal: strip(lines[1]), files: strip(lines[2]) }
+      }
+    }
+  }
+
+  // Super+1…9 run favorites while Omacast is open. Hyprland normally takes
+  // Super+digit for workspaces, so the launcher enters a small submap
+  // ("omacast", defined in hyprland.lua) while it is visible.
+  function enterLauncherSubmap(on) {
+    Quickshell.execDetached(["hyprctl", "dispatch", on ? "hl.dsp.submap(\"omacast\")" : "hl.dsp.submap(\"reset\")"])
+  }
+
+  function openFavorite(n) {
+    var favs = root.favoriteRows()
+    var row = favs[Number(n) - 1]
+    if (!row || !row.actions || row.actions.length === 0) return "unknown"
+    root.perform(row, row.actions[0])
+    return "ok"
+  }
+
+  function moveFavorite(id, delta) {
+    var fav = (root.config.favorites || []).slice()
+    var at = fav.indexOf(id)
+    var to = at + delta
+    if (at < 0 || to < 0 || to >= fav.length) return
+    fav.splice(at, 1)
+    fav.splice(to, 0, id)
+    root.setSetting("favorites", fav)
+  }
+
+  // Rebuild and put the cursor back on the row with this id.
+  function rebuildKeeping(id) {
+    root.rebuild()
+    for (var i = 0; i < root.rows.length; i++) {
+      if (root.rows[i].id === id) {
+        root.selectedIndex = i
+        resultList.positionViewAtIndex(i, ListView.Contain)
+        return
+      }
+    }
+  }
+
+  // Rows the Extensions settings list (grouped, filterable).
+  function extensionRows(filter) {
+    var groups = [
+      { title: "Applications", kinds: ["app"] },
+      { title: "Omacast", kinds: ["builtin"] },
+      { title: "Omarchy", kinds: ["command", "menu"] },
+      { title: "Window Management", kinds: ["window-action"] },
+      { title: "System", kinds: ["system"] },
+      { title: "Quicklinks", kinds: ["quicklink"] },
+      { title: "Snippets", kinds: ["snippet"] },
+      { title: "Commands", kinds: ["custom"] }
+    ]
+    var rows = root.rawCatalog()
+    var q = String(filter || "").toLowerCase()
+    var out = []
+    for (var g = 0; g < groups.length; g++) {
+      var items = rows.filter(function(r) {
+        if (groups[g].kinds.indexOf(r.kind) < 0) return false
+        return !q || String(r.title).toLowerCase().indexOf(q) >= 0 || String(r.subtitle || "").toLowerCase().indexOf(q) >= 0
+      })
+      if (items.length === 0) continue
+      out.push({ id: "group." + g, kind: "group", title: groups[g].title + " (" + items.length + ")" })
+      out = out.concat(items.slice(0, q ? 200 : 120))
+    }
+    return out
   }
 
   function normalizeDesktopId(id) {
@@ -319,7 +592,7 @@ Item {
     }
     root.windowRows = rows
     root.runningClasses = running
-    root.rebuild()
+    root.refreshKeepingSelection()
   }
 
   function isRunning(row) {
@@ -385,7 +658,7 @@ Item {
       }
     }
     root.omarchyRows = rows
-    if (root.opened) root.rebuild()
+    if (root.opened) root.refreshKeepingSelection()
   }
 
   function homepage(url) {
@@ -416,24 +689,8 @@ Item {
       })
     }
 
-    var snippets = c.snippets || []
-    for (i = 0; i < snippets.length; i++) {
-      var s = snippets[i]
-      rows.push({
-        id: "snippet." + (s.keyword || Engine.slug(s.name)),
-        kind: "snippet",
-        title: s.name,
-        subtitle: String(s.text || "").replace(/\s+/g, " ").substring(0, 80),
-        accessory: "Snippet",
-        glyph: s.icon || "󰅪",
-        keywords: [s.keyword || "", "snippet text"],
-        boost: 0,
-        actions: [
-          { title: "Paste Snippet", op: "paste", arg: s.text },
-          { title: "Copy Snippet", op: "copy-expand", arg: s.text }
-        ]
-      })
-    }
+    for (i = 0; i < root.snippets.length; i++)
+      rows.push(root.snippetRow(root.snippets[i], i))
 
     var commands = c.commands || []
     for (i = 0; i < commands.length; i++) {
@@ -444,7 +701,7 @@ Item {
         title: cmd.name,
         subtitle: cmd.command,
         accessory: "Command",
-        glyph: cmd.icon || "",
+        glyph: cmd.icon || "\uf120",
         keywords: [cmd.keyword || "", "custom"],
         actions: [
           { title: "Run Command", op: cmd.terminal ? "terminal" : "exec", arg: cmd.command },
@@ -459,21 +716,51 @@ Item {
     rows.push({ id: "builtin.note", kind: "builtin", title: "Create Note", subtitle: "Type “note …”", accessory: "Omacast", glyph: "󱞁", keywords: ["note new markdown"], actions: [{ title: "Create Note…", op: "prefill", arg: "note " }] })
     rows.push({ id: "builtin.define", kind: "builtin", title: "Define Word", subtitle: "Type “define …”", accessory: "Omacast", glyph: "󰂺", keywords: ["dictionary meaning"], actions: [{ title: "Define…", op: "prefill", arg: "define " }] })
     rows.push({ id: "builtin.files", kind: "builtin", title: "Search Files", subtitle: "Type “f …”", accessory: "Omacast", glyph: "󰈞", keywords: ["find file folder"], actions: [{ title: "Search Files…", op: "prefill", arg: "f " }] })
-    rows.push({ id: "builtin.config", kind: "builtin", title: "Omacast Settings", subtitle: "~/.config/omacast/config.jsonc", accessory: "Omacast", glyph: "", keywords: ["preferences config quicklinks snippets"], actions: [{ title: "Edit Config", op: "edit-file", arg: root.configPath }] })
+    rows.push({ id: "mode.snippets", kind: "builtin", title: "Search Snippets", subtitle: "Paste, edit and create snippets", accessory: "Omacast", glyph: "󰅪", keywords: ["snippet text expander"], actions: [{ title: "Open Snippets", op: "mode", arg: "snippets" }] })
+    rows.push({ id: "builtin.snippet-new", kind: "builtin", title: "Create Snippet", subtitle: "Reusable text with placeholders", accessory: "Omacast", glyph: "󰅪", keywords: ["new snippet"], actions: [{ title: "Create Snippet", op: "snippet-new" }] })
+    rows.push({ id: "builtin.notes", kind: "builtin", title: "Notes", subtitle: "Floating Markdown notes", accessory: "Omacast", glyph: "󱞁", keywords: ["notes scratchpad markdown floating"], actions: [{ title: "Show Notes", op: "notes" }, { title: "Create Note", op: "note-create", arg: "" }] })
+    rows.push({ id: "builtin.notes-search", kind: "builtin", title: "Search Notes", subtitle: "Browse your notes", accessory: "Omacast", glyph: "󱞁", keywords: ["find notes"], actions: [{ title: "Browse Notes", op: "notes-browse" }] })
+    rows.push({ id: "mode.settings", kind: "builtin", title: "Omacast Settings", subtitle: "Hotkeys, search, snippets, notes, AI", accessory: "Omacast", glyph: "\uf013", keywords: ["preferences config extensions"], actions: [{ title: "Open Settings", op: "mode", arg: "settings" }, { title: "Edit Config File", op: "edit-file", arg: root.configPath }] })
 
     root.configRows = rows
-    if (root.opened) root.rebuild()
+    if (root.opened) root.refreshKeepingSelection()
   }
 
+  function snippetRow(s, i) {
+    var copyFirst = (root.config.snippetSettings || {}).primaryAction === "copy"
+    var paste = { title: "Paste Snippet", op: "snippet", arg: i }
+    var copy = { title: "Copy Snippet", op: "snippet-copy", arg: i }
+    return {
+      id: "snippet." + (s.keyword || Engine.slug(s.name)),
+      kind: "snippet",
+      index: i,
+      title: s.name,
+      subtitle: Snippets.preview(s.text),
+      accessory: s.keyword ? s.keyword : "Snippet",
+      glyph: "󰅪",
+      text: s.text,
+      keywords: [s.keyword || "", "snippet"],
+      actions: (copyFirst ? [copy, paste] : [paste, copy]).concat([
+        { title: "Edit Snippet", op: "snippet-edit", arg: i },
+        { title: "Duplicate Snippet", op: "snippet-duplicate", arg: i },
+        { title: "Create Snippet", op: "snippet-new" },
+        { title: "Delete Snippet…", op: "snippet-delete", arg: i }
+      ])
+    }
+  }
+
+  // Favorites are row ids; plain desktop ids from older configs still work.
   function favoriteRows() {
     var fav = root.config.favorites || []
+    if (fav.length === 0) return []
+    var rows = root.catalog()
+    var byId = ({})
+    for (var r = 0; r < rows.length; r++) byId[rows[r].id] = rows[r]
     var out = []
     for (var i = 0; i < fav.length; i++) {
-      var id = String(fav[i]).replace(/\.desktop$/, "")
-      for (var j = 0; j < root.appRows.length; j++) {
-        var a = root.appRows[j]
-        if (a.appId === id || a.appId === id + ".desktop") { out.push(a); break }
-      }
+      var id = String(fav[i])
+      var row = byId[id] || byId["app." + id] || byId["app." + id + ".desktop"]
+      if (row) out.push(row)
     }
     return out
   }
@@ -492,7 +779,28 @@ Item {
   function rebuild() {
     if (root.mode === "search") root.rebuildSearch()
     else if (root.mode === "clipboard") root.rebuildClipboard()
+    else if (root.mode === "snippets") root.rebuildSnippets()
     else if (root.mode === "emoji") root.rebuildEmoji()
+  }
+
+  function rebuildSnippets() {
+    var q = root.query.trim().toLowerCase()
+    var rows = []
+    for (var i = 0; i < root.snippets.length; i++) {
+      var s = root.snippets[i]
+      var hay = (s.name + " " + (s.keyword || "") + " " + s.text).toLowerCase()
+      if (q && hay.indexOf(q) < 0) continue
+      rows.push(root.snippetRow(s, i))
+    }
+    rows.push({
+      id: "snippet-create",
+      kind: "builtin",
+      title: q ? "Create Snippet “" + root.query.trim() + "”" : "Create Snippet",
+      subtitle: "Ctrl+N",
+      glyph: "\uf067",
+      actions: [{ title: "Create Snippet", op: "snippet-new" }]
+    })
+    root.setRows(rows)
   }
 
   function rebuildSearch() {
@@ -501,7 +809,12 @@ Item {
 
     if (!q) {
       var seen = ({})
-      var fav = root.favoriteRows()
+      var fav = root.favoriteRows().map(function(r, n) {
+        var c = {}
+        for (var k in r) c[k] = r[k]
+        if (n < 9) c.favIndex = n + 1
+        return c
+      })
       for (var f = 0; f < fav.length; f++) seen[fav[f].id] = true
       root.pushSection(out, "Favorites", fav)
       var recentAll = Engine.recentRows(root.catalog(), root.usage, 14)
@@ -511,7 +824,7 @@ Item {
         recent.push(recentAll[r])
       }
       root.pushSection(out, "Recent", recent)
-      root.pushSection(out, "Open Windows", root.windowRows.slice(0, 8))
+      if (root.searchOpt("windows", true)) root.pushSection(out, "Open Windows", root.windowRows.slice(0, 8))
       var suggestions = []
       for (var s = 0; s < root.configRows.length; s++) {
         if (root.configRows[s].kind === "builtin" && suggestions.length < 4) suggestions.push(root.configRows[s])
@@ -549,7 +862,7 @@ Item {
     }
     if (q[0] === "?" && q.length > 1) lead.push(root.askRow(q.substring(1).trim()))
 
-    if (root.calc && root.calc.query === q) {
+    if (root.searchOpt("calculator", true) && root.calc && root.calc.query === q) {
       out.push(root.header("Calculator"))
       out.push({
         id: "calc",
@@ -566,13 +879,16 @@ Item {
     root.pushSection(out, "Quick Action", lead)
 
     var filesOnly = keyword === "f" && kw.rest.length > 0
-    if (!filesOnly) root.pushSection(out, "Results", Engine.rank(root.catalog(), q, root.usage, 40))
+    var pool = root.catalog()
+    if (!root.searchOpt("windows", true)) pool = pool.filter(function(r) { return r.kind !== "window" })
+    if (!filesOnly) root.pushSection(out, "Results", Engine.rank(pool, q, root.usage, 40, root.searchOpt("sensitivity", "medium")))
     if (root.fileRows.length > 0 && root.fileRowsQuery === root.fileQuery()) root.pushSection(out, "Files", root.fileRows)
 
+    var enabled = root.searchOpt("fallbacks", ["ai", "web", "define", "note"])
     var fallbacks = []
-    if (root.config.ai === undefined || root.config.ai.enabled !== false) fallbacks.push(root.askRow(q))
+    if (enabled.indexOf("ai") >= 0 && (root.config.ai === undefined || root.config.ai.enabled !== false)) fallbacks.push(root.askRow(q))
     var searchUrl = Engine.fillTemplate((root.config.search && root.config.search.url) || "https://www.google.com/search?q={query}", q)
-    fallbacks.push({
+    if (enabled.indexOf("web") >= 0) fallbacks.push({
       id: "fallback.web",
       kind: "fallback",
       title: "Search the Web for “" + q + "”",
@@ -581,11 +897,16 @@ Item {
       glyph: "󰖟",
       actions: [{ title: "Search the Web", op: "url", arg: searchUrl }]
     })
-    if (/^[A-Za-z][A-Za-z'\-]{1,40}$/.test(q)) fallbacks.push(root.defineRow(q))
-    if (keyword !== "note") fallbacks.push(root.createNoteRow(q))
+    if (enabled.indexOf("define") >= 0 && /^[A-Za-z][A-Za-z'\-]{1,40}$/.test(q)) fallbacks.push(root.defineRow(q))
+    if (enabled.indexOf("note") >= 0 && keyword !== "note") fallbacks.push(root.createNoteRow(q))
     root.pushSection(out, "Use “" + (q.length > 32 ? q.substring(0, 32) + "…" : q) + "” with…", fallbacks)
 
     root.setRows(out)
+  }
+
+  function searchOpt(key, fallback) {
+    var s = root.config.search || {}
+    return s[key] === undefined ? fallback : s[key]
   }
 
   function askRow(text) {
@@ -648,10 +969,9 @@ Item {
         var line = text.replace(/^\s+/, "").split("\n")[0].substring(0, 160)
         var lines = text.split("\n").length
         var isUrl = /^https?:\/\/\S+$/.test(text.trim())
-        var actions = [
-          { title: "Paste", op: "clip-paste", arg: i },
-          { title: "Copy to Clipboard", op: "clip-copy", arg: i }
-        ]
+        var actions = root.clipCopyFirst()
+          ? [{ title: "Copy to Clipboard", op: "clip-copy", arg: i }, { title: "Paste", op: "clip-paste", arg: i }]
+          : [{ title: "Paste", op: "clip-paste", arg: i }, { title: "Copy to Clipboard", op: "clip-copy", arg: i }]
         if (isUrl) actions.push({ title: "Open Link", op: "url", arg: text.trim() })
         out.push({
           id: "clip." + i, kind: "clip", clipType: "text", index: i,
@@ -664,6 +984,10 @@ Item {
       }
     }
     root.setRows(out)
+  }
+
+  function clipCopyFirst() {
+    return (root.config.clipboard || {}).primaryAction === "copy"
   }
 
   function rebuildEmoji() {
@@ -683,9 +1007,31 @@ Item {
     emojiGrid.positionViewAtBeginning()
   }
 
+  // Results that arrive late (files, calculator, window list) must not yank
+  // the cursor or close the action panel; a new query or view resets both.
+  property bool keepSelection: false
+
+  function refreshKeepingSelection() {
+    root.keepSelection = true
+    root.rebuild()
+    root.keepSelection = false
+  }
+
   function setRows(out) {
+    var prevId = root.selectedRow ? root.selectedRow.id : ""
+    var keep = root.keepSelection && prevId !== ""
+    var contentY = resultList.contentY
     root.rows = out
     root.selectedIndex = -1
+    if (keep) {
+      for (var k = 0; k < out.length; k++) {
+        if (out[k].id === prevId && out[k].kind !== "header") { root.selectedIndex = k; break }
+      }
+    }
+    if (root.selectedIndex >= 0) {
+      Qt.callLater(function() { resultList.contentY = contentY })
+      return
+    }
     for (var i = 0; i < out.length; i++) {
       if (out[i].kind !== "header") { root.selectedIndex = i; break }
     }
@@ -723,20 +1069,25 @@ Item {
 
   function setMode(next) {
     if (next === root.mode) return
+    if (root.recording) root.setRecording(false)
     root.mode = next
     root.actionsOpen = false
     if (next !== "detail") {
       input.text = ""
       root.query = ""
     }
+    if (next === "snippet-edit") Qt.callLater(function() { snippetName.focusInput() })
+    if (next === "snippet-args") Qt.callLater(function() { argsRepeater.focusFirst() })
     if (next === "emoji" && root.emojiData.length === 0) emojiFile.reload()
     root.rebuild()
-    Qt.callLater(function() { input.forceActiveFocus() })
+    if (next !== "snippet-edit" && next !== "snippet-args") Qt.callLater(function() { input.forceActiveFocus() })
   }
 
   function cycleMode(delta) {
     var modes = root.tabs.map(function(t) { return t.mode })
-    var at = modes.indexOf(root.mode === "detail" ? "search" : root.mode)
+    var base = (root.mode === "detail" || root.mode === "settings") ? "search"
+      : (root.mode === "snippet-edit" || root.mode === "snippet-args") ? "snippets" : root.mode
+    var at = modes.indexOf(base)
     root.setMode(modes[(at + delta + modes.length) % modes.length])
   }
 
@@ -747,11 +1098,11 @@ Item {
     if (root.mode !== "search") return
 
     var q = text.trim()
-    if (Engine.isCalcQuery(q)) calcTimer.restart()
+    if (root.searchOpt("calculator", true) && Engine.isCalcQuery(q)) calcTimer.restart()
     else root.calc = null
 
     var fq = root.fileQuery()
-    if (fq.length >= 3) fileTimer.restart()
+    if (root.searchOpt("files", true) && fq.length >= root.searchOpt("fileMinChars", 3)) fileTimer.restart()
     else { root.fileRows = []; root.fileRowsQuery = "" }
   }
 
@@ -810,7 +1161,10 @@ Item {
     if (!action) return
     var op = action.op
     var keepOpen = op === "mode" || op === "prefill" || op === "ai" || op === "define"
-      || op === "uninstall" || op === "confirm-exec"
+      || op === "uninstall" || op === "confirm-exec" || op === "favorite" || op === "favorite-move" || op === "configure"
+      || op === "snippet" || op === "snippet-copy" || op === "snippet-edit" || op === "snippet-new"
+      || op === "snippet-duplicate" || op === "snippet-delete" || op === "snippet-delete-now"
+    if (op === "snippet" || op === "snippet-copy") root.recordUsage(row)
     if (!keepOpen) {
       root.recordUsage(row)
       root.close()
@@ -886,9 +1240,51 @@ Item {
       root.exec("omarchy-launch-editor " + Engine.shellQuote(action.arg))
       break
     case "note-create":
-      var dir = root.notesDir()
-      var file = dir + "/" + Engine.slug(action.arg) + ".md"
-      root.exec("mkdir -p " + Engine.shellQuote(dir) + " && { [ -e " + Engine.shellQuote(file) + " ] || printf '# %s\\n\\n' " + Engine.shellQuote(action.arg) + " > " + Engine.shellQuote(file) + "; } && omarchy-launch-editor " + Engine.shellQuote(file))
+      notesWin.newNote(String(action.arg || ""))
+      break
+    case "note-open":
+      notesWin.open(action.arg)
+      break
+    case "notes":
+      notesWin.open("")
+      break
+    case "notes-browse":
+      notesWin.open("")
+      Qt.callLater(function() { if (!notesWin.browsing) notesWin.toggleBrowse() })
+      break
+    case "favorite":
+      root.toggleFavorite(action.arg)
+      root.rebuildKeeping(action.arg)
+      break
+    case "favorite-move":
+      root.moveFavorite(action.arg, action.arg2)
+      root.rebuildKeeping(action.arg)
+      break
+    case "configure":
+      root.setMode("settings")
+      settingsView.section = "extensions"
+      input.text = action.arg
+      root.query = action.arg
+      break
+    case "snippet":
+    case "snippet-copy":
+      var snip = root.snippets[action.arg]
+      if (snip) root.useSnippet(snip, { copy: op === "snippet-copy" })
+      break
+    case "snippet-new":
+      root.editSnippet(-1)
+      break
+    case "snippet-edit":
+      root.editSnippet(action.arg)
+      break
+    case "snippet-duplicate":
+      root.duplicateSnippet(action.arg)
+      break
+    case "snippet-delete":
+      root.pendingConfirm = { message: "Delete snippet “" + row.title + "”?", confirmText: "Delete", row: row, action: { op: "snippet-delete-now", arg: action.arg } }
+      break
+    case "snippet-delete-now":
+      root.deleteSnippet(action.arg)
       break
     case "mode":
       root.setMode(action.arg)
@@ -953,6 +1349,8 @@ Item {
     root.aiStatus = "Thinking…"
     var args = [root.bin("omacast-ai"), "--model", (root.config.ai && root.config.ai.model) || "haiku"]
     if (root.aiSession) args = args.concat(["--resume", root.aiSession])
+    var instructions = (root.config.ai && root.config.ai.instructions) || ""
+    if (instructions.trim()) args = args.concat(["--instructions", instructions])
     aiProc.command = args.concat([text])
     aiProc.running = true
   }
@@ -1036,7 +1434,7 @@ Item {
         } else if (calcProc.input === root.query.trim()) {
           root.calc = null
         }
-        if (root.mode === "search") root.rebuildSearch()
+        if (root.mode === "search") root.refreshKeepingSelection()
       }
     }
     onExited: if (pending) { pending = false; calcTimer.restart() }
@@ -1093,7 +1491,7 @@ Item {
         }
         root.fileRows = rows
         root.fileRowsQuery = filesProc.query
-        if (root.mode === "search") root.rebuildSearch()
+        if (root.mode === "search") root.refreshKeepingSelection()
       }
     }
     onExited: {
@@ -1102,42 +1500,50 @@ Item {
     }
   }
 
-  Process {
-    id: notesProc
-    function load() {
-      var dir = root.notesDir()
-      notesProc.command = ["bash", "-c", "[ -d \"$1\" ] && fd -e md -t f --max-depth 4 --absolute-path . \"$1\"", "_", dir]
-      notesProc.running = true
+  // ------------------------------------------------------------- notes
+  NotesWindow {
+    id: notesWin
+    notesDir: root.notesDir()
+    stateDir: root.stateDir
+    fontFamily: root.fontFamily
+    baseSize: (root.config.notes && root.config.notes.textSize) || 15
+    showFormatBar: !root.config.notes || root.config.notes.formatBar !== false
+    escapeCloses: !root.config.notes || root.config.notes.escapeCloses !== false
+    onListChanged: root.buildNoteRows()
+  }
+
+  function buildNoteRows() {
+    var list = notesWin.noteList
+    var rows = []
+    for (var i = 0; i < list.length; i++) {
+      var n = list[i]
+      rows.push({
+        id: "note." + n.path,
+        kind: "note",
+        title: n.title,
+        subtitle: n.preview || "Note",
+        accessory: "Note",
+        glyph: "󱞁",
+        keywords: ["note"],
+        actions: [
+          { title: "Open in Notes", op: "note-open", arg: n.path },
+          { title: "Open in Editor", op: "edit-file", arg: n.path },
+          { title: "Show in Files", op: "reveal", arg: n.path },
+          { title: "Copy Contents", op: "exec-copy-file", arg: n.path }
+        ]
+      })
     }
-    stdout: StdioCollector {
-      onStreamFinished: {
-        var lines = String(this.text || "").split("\n")
-        var rows = []
-        var dir = root.notesDir()
-        for (var i = 0; i < lines.length; i++) {
-          var path = lines[i]
-          if (!path) continue
-          var base = path.split("/").pop().replace(/\.md$/, "")
-          var title = base.replace(/[-_]+/g, " ")
-          title = title.charAt(0).toUpperCase() + title.substring(1)
-          rows.push({
-            id: "note." + path,
-            kind: "note",
-            title: title,
-            subtitle: path.replace(dir + "/", "").replace(/[^\/]+$/, "").replace(/\/$/, "") || "Notes",
-            accessory: "Note",
-            glyph: "󱞁",
-            keywords: ["note", base],
-            actions: [
-              { title: "Open Note", op: "edit-file", arg: path },
-              { title: "Copy Contents", op: "exec-copy-file", arg: path },
-              { title: "Show in Files", op: "reveal", arg: path }
-            ]
-          })
-        }
-        root.noteRows = rows
-      }
-    }
+    root.noteRows = rows
+  }
+
+  function toggleNotes() {
+    notesWin.toggle()
+    return "ok"
+  }
+
+  function openNotes(path) {
+    notesWin.open(String(path || ""))
+    return "ok"
   }
 
   Process {
@@ -1239,6 +1645,356 @@ Item {
   function applyConfig() {
     root.config = Engine.mergeConfig(root.defaultConfig, root.userConfig)
     root.buildConfigRows()
+    root.migrateSnippets()
+    hyprTimer.restart()
+  }
+
+  // ------------------------------------------------------------ settings
+  function cloneJson(v) { return JSON.parse(JSON.stringify(v === undefined ? null : v)) }
+
+  // Set a dotted path (e.g. "general.hotkey") in the user config and save.
+  function setSetting(path, value) {
+    var next = root.cloneJson(root.userConfig) || {}
+    var parts = path.split(".")
+    var o = next
+    for (var i = 0; i < parts.length - 1; i++) {
+      if (typeof o[parts[i]] !== "object" || o[parts[i]] === null || Array.isArray(o[parts[i]])) {
+        // Start from the merged value so siblings keep their defaults.
+        var merged = root.config
+        for (var j = 0; j <= i; j++) merged = merged ? merged[parts[j]] : undefined
+        o[parts[i]] = (merged && typeof merged === "object" && !Array.isArray(merged)) ? root.cloneJson(merged) : {}
+      }
+      o = o[parts[i]]
+    }
+    o[parts[parts.length - 1]] = value
+    root.writeUserConfig(next)
+  }
+
+  function writeUserConfig(next) {
+    root.userConfig = next
+    root.applyConfig()
+    userConfigFile.setText("// Omacast settings. Edited by Omacast Settings; unset keys use the defaults.\n"
+      + JSON.stringify(next, null, 2) + "\n")
+  }
+
+  function overrideFor(id) {
+    var o = root.config.overrides || {}
+    return o[id] || {}
+  }
+
+  function setOverride(id, field, value) {
+    var all = root.cloneJson(root.config.overrides || {})
+    var entry = all[id] || {}
+    if (value === "" || value === false || value === null) delete entry[field]
+    else entry[field] = value
+    if (Object.keys(entry).length === 0) delete all[id]
+    else all[id] = entry
+    root.setSetting("overrides", all)
+  }
+
+  function isFavorite(id) {
+    return (root.config.favorites || []).indexOf(id) >= 0
+  }
+
+  function toggleFavorite(id) {
+    var fav = (root.config.favorites || []).slice()
+    var at = fav.indexOf(id)
+    if (at >= 0) fav.splice(at, 1)
+    else fav.push(id)
+    root.setSetting("favorites", fav)
+  }
+
+  function resetUsage() {
+    root.usage = ({})
+    usageFile.setText("{}\n")
+  }
+
+  function resetSettings() {
+    root.writeUserConfig({})
+  }
+
+  function editFile(path) {
+    root.close()
+    root.exec("omarchy-launch-editor " + Engine.shellQuote(path))
+  }
+
+  function openUrl(url) {
+    root.close()
+    Quickshell.execDetached(["xdg-open", url])
+  }
+
+  function exportBackup() {
+    var stamp = new Date().toISOString().substring(0, 10)
+    var path = root.home + "/omacast-backup-" + stamp + ".json"
+    var data = JSON.stringify({ omacast: root.version, config: root.userConfig, snippets: root.snippets }, null, 2)
+    Quickshell.execDetached(["bash", "-c", "printf '%s\\n' \"$1\" > \"$2\" && notify-send 'Omacast' \"Settings exported to $2\"", "_", data, path])
+  }
+
+  function importBackup() {
+    importProc.running = true
+  }
+
+  Process {
+    id: importProc
+    command: ["bash", "-c", "f=$(ls -t \"$HOME\"/omacast-backup-*.json 2>/dev/null | head -1); [ -n \"$f\" ] && cat \"$f\""]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var data = JSON.parse(this.text)
+          if (data.config) root.writeUserConfig(data.config)
+          if (Array.isArray(data.snippets)) root.saveSnippets(data.snippets)
+          Quickshell.execDetached(["notify-send", "Omacast", "Settings imported"])
+        } catch (e) {
+          Quickshell.execDetached(["notify-send", "Omacast", "No backup found in your home folder"])
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------- snippets
+  FileView {
+    id: snippetsFile
+    path: root.snippetsPath
+    watchChanges: true
+    printErrors: false
+    atomicWrites: true
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(text())
+        root.snippets = Array.isArray(parsed) ? parsed : []
+      } catch (e) { root.snippets = [] }
+      root.snippetsLoaded = true
+      root.buildConfigRows()
+      hyprTimer.restart()
+      if (root.opened && root.mode === "snippets") root.rebuild()
+    }
+    onLoadFailed: {
+      root.snippetsLoaded = true
+      root.migrateSnippets()
+    }
+    onFileChanged: reload()
+  }
+
+  // First run: seed snippets.json from an older config's "snippets" array,
+  // or from a few useful examples.
+  function migrateSnippets() {
+    if (!root.snippetsLoaded || root.snippets.length > 0 || snippetsFile.loaded) return
+    var legacy = Array.isArray(root.userConfig.snippets) ? root.userConfig.snippets : null
+    var seed = legacy || [
+      { name: "Today's Date", keyword: ";date", text: "{date}" },
+      { name: "Timestamp", keyword: ";now", text: "{datetime}" },
+      { name: "Shrug", keyword: ";shrug", text: "¯\\_(ツ)_/¯" },
+      { name: "Email Reply", keyword: ";re", text: "Hi {argument name=\"Name\" default=\"there\"},\n\n{cursor}\n\nBest,\n{user}" }
+    ]
+    root.saveSnippets(seed)
+  }
+
+  function saveSnippets(list) {
+    root.snippets = list
+    snippetsFile.setText(JSON.stringify(list, null, 2) + "\n")
+    root.buildConfigRows()
+    hyprTimer.restart()
+  }
+
+  function snippetIndex(s) {
+    for (var i = 0; i < root.snippets.length; i++) if (root.snippets[i] === s) return i
+    return -1
+  }
+
+  function editSnippet(index) {
+    var src = index >= 0 ? root.snippets[index] : { name: "", keyword: "", text: "" }
+    root.snippetDraft = { index: index, name: src.name || "", keyword: src.keyword || "", text: src.text || "" }
+    root.setMode("snippet-edit")
+  }
+
+  function saveSnippetDraft() {
+    var d = root.snippetDraft
+    if (!d || !String(d.name || "").trim() || !String(d.text || "").length) return false
+    var list = root.snippets.slice()
+    var entry = { name: d.name.trim(), keyword: String(d.keyword || "").replace(/\s+/g, ""), text: d.text }
+    if (d.index >= 0) list[d.index] = entry
+    else list.push(entry)
+    root.saveSnippets(list)
+    root.snippetDraft = null
+    root.setMode("snippets")
+    return true
+  }
+
+  function deleteSnippet(index) {
+    var list = root.snippets.slice()
+    list.splice(index, 1)
+    root.saveSnippets(list)
+    root.rebuild()
+  }
+
+  function duplicateSnippet(index) {
+    var s = root.snippets[index]
+    var list = root.snippets.slice()
+    list.splice(index + 1, 0, { name: s.name + " Copy", keyword: "", text: s.text })
+    root.saveSnippets(list)
+    root.rebuild()
+  }
+
+  function latestClipboardText() {
+    for (var i = 0; i < root.clipboardHistory.length; i++)
+      if (root.clipboardHistory[i].type !== "image") return String(root.clipboardHistory[i].text || "")
+    return ""
+  }
+
+  // Paste (or copy) a snippet; asks for {argument}s first when it has any.
+  function useSnippet(snippet, opts) {
+    var o = opts || {}
+    var args = Snippets.argumentsOf(snippet.text, root.snippets)
+    if (args.length > 0 && !o.arguments) {
+      root.snippetArgs = args
+      root.snippetPending = { snippet: snippet, copy: !!o.copy, del: o.del || 0 }
+      root.opened = true
+      root.setMode("snippet-args")
+      return
+    }
+    var out = Snippets.expand(snippet.text, {
+      snippets: root.snippets,
+      clipboard: root.latestClipboardText(),
+      user: Quickshell.env("USER"),
+      arguments: o.arguments || {}
+    })
+    root.close()
+    if (o.copy) {
+      Quickshell.execDetached(["wl-copy", "--", out.text])
+      return
+    }
+    var argv = [root.bin("omacast-paste")]
+    if (o.del) argv = argv.concat(["--delete", String(o.del)])
+    if (out.cursorBack) argv = argv.concat(["--cursor-back", String(out.cursorBack)])
+    Quickshell.execDetached(argv.concat([out.text]))
+  }
+
+  function submitSnippetArgs() {
+    var p = root.snippetPending
+    if (!p) return
+    var values = {}
+    for (var i = 0; i < root.snippetArgs.length; i++) values[root.snippetArgs[i].name] = root.snippetArgs[i].value
+    root.snippetPending = null
+    root.useSnippet(p.snippet, { arguments: values, copy: p.copy, del: p.del })
+  }
+
+  // Called by the Hyprland key hook when a keyword was typed in any app.
+  function expandKeyword(keyword) {
+    var kw = String(keyword || "")
+    // Typing a keyword into Omacast's own search box should just search.
+    if (root.opened) return "ignored"
+    for (var i = 0; i < root.snippets.length; i++) {
+      var s = root.snippets[i]
+      if (!s.keyword || s.keyword !== kw) continue
+      // Expand in place. Only arguments without a default need a prompt.
+      var args = Snippets.argumentsOf(s.text, root.snippets)
+      var values = {}
+      var needsPrompt = false
+      for (var a = 0; a < args.length; a++) {
+        values[args[a].name] = args[a].value
+        if (!args[a].value) needsPrompt = true
+      }
+      root.useSnippet(s, needsPrompt ? { del: kw.length } : { del: kw.length, arguments: values })
+      return "ok"
+    }
+    return "unknown"
+  }
+
+  // ------------------------------------------------- Hyprland integration
+  // Omacast owns ~/.config/omacast/hyprland.lua: launcher/notes/menu hotkeys,
+  // per-command hotkeys and the snippet keyword hook. bindings.lua loads it.
+  Timer {
+    id: hyprTimer
+    interval: 700
+    onTriggered: root.applyHyprland(false)
+  }
+
+  property string lastHyprLua: ""
+
+  function luaString(s) {
+    return "\"" + String(s).replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/\n/g, "\\n") + "\""
+  }
+
+  function hyprLua() {
+    var g = root.config.general || {}
+    var n = root.config.notes || {}
+    var ss = root.config.snippetSettings || {}
+    var shellCall = "omarchy-shell shell "
+    var lines = [
+      "-- Generated by Omacast. Change these in Omacast Settings, not here.",
+      "local function bind(keys, desc, cmd)",
+      "  if not keys or keys == \"\" then return end",
+      "  pcall(hl.unbind, keys)",
+      "  local ok, err = pcall(hl.bind, keys, hl.dsp.exec_cmd(cmd), { description = desc })",
+      "  if not ok then io.stderr:write(\"omacast: cannot bind \" .. keys .. \": \" .. tostring(err) .. \"\\n\") end",
+      "end",
+      "",
+      "pcall(hl.define_submap, \"omacast-record\", function() end)",
+      "",
+      "-- Floating notes: a pinned floating window above everything.",
+      "local notes = { title = \"^Omacast Notes$\" }",
+      "pcall(hl.window_rule, { match = notes, float = true, pin = true, size = { 460, 420 }, move = { \"(monitor_w-window_w-40)\", \"(monitor_h*0.06)\" } })",
+      "pcall(hl.window_rule, { match = notes, tag = \"-default-opacity\", opacity = \"1 1\", border_size = 0 })",
+      ""
+    ]
+    lines.push("bind(" + root.luaString(g.hotkey || "") + ", \"Omacast\", " + root.luaString(shellCall + "toggle stefans.omacast '{}'") + ")")
+    // While Omacast is open: Super+1…9 open favorites, the hotkey still closes
+    // it, and Super+Escape always gets you out of the submap.
+    lines.push("pcall(hl.define_submap, \"omacast\", function()")
+    lines.push("  for i = 1, 9 do")
+    lines.push("    pcall(hl.bind, \"SUPER + \" .. i, hl.dsp.exec_cmd(" + root.luaString(shellCall + "call stefans.omacast openFavorite ") + " .. i), { description = \"Omacast favorite \" .. i })")
+    lines.push("  end")
+    if (g.hotkey) lines.push("  pcall(hl.bind, " + root.luaString(g.hotkey) + ", hl.dsp.exec_cmd(" + root.luaString(shellCall + "hide stefans.omacast") + "), { description = \"Close Omacast\" })")
+    lines.push("  pcall(hl.bind, \"SUPER + ESCAPE\", hl.dsp.submap(\"reset\"), { description = \"Leave Omacast submap\" })")
+    lines.push("end)")
+    lines.push("bind(" + root.luaString(g.menuHotkey || "") + ", \"Omarchy menu\", \"omarchy-menu toggle root\")")
+    lines.push("bind(" + root.luaString(n.hotkey || "") + ", \"Omacast Notes\", " + root.luaString(shellCall + "call stefans.omacast toggleNotes ''") + ")")
+
+    var overrides = root.config.overrides || {}
+    var runBin = root.bin("omacast")
+    for (var id in overrides) {
+      var hk = overrides[id] && overrides[id].hotkey
+      if (!hk) continue
+      lines.push("bind(" + root.luaString(hk) + ", " + root.luaString("Omacast: " + id) + ", " + root.luaString(runBin + " run " + Engine.shellQuote(id)) + ")")
+    }
+
+    if (ss.expansion) {
+      var keywords = root.snippets.map(function(s) { return s.keyword }).filter(function(k) { return k && k.length >= 2 })
+      lines.push("")
+      lines.push("omacast_expansion = {")
+      lines.push("  keywords = { " + keywords.map(root.luaString).join(", ") + " },")
+      lines.push("  exclude = { " + (ss.exclude || []).map(root.luaString).join(", ") + " },")
+      lines.push("  within_words = " + (ss.withinWords ? "true" : "false") + ",")
+      lines.push("}")
+      lines.push("pcall(dofile, " + root.luaString(decodeURIComponent(String(Qt.resolvedUrl("hypr/expand.lua")).replace(/^file:\/\//, ""))) + ")")
+    }
+    return lines.join("\n") + "\n"
+  }
+
+  function applyHyprland(force) {
+    if (!root.snippetsLoaded || !defaultConfigFile.loaded) return
+    var lua = root.hyprLua()
+    if (!force && lua === root.lastHyprLua) return
+    var first = root.lastHyprLua === ""
+    root.lastHyprLua = lua
+    hyprFile.setText(lua)
+    // Reload Hyprland unless this is the startup write of an unchanged file.
+    if (!first || force) Quickshell.execDetached(["bash", "-c", "sleep 0.2; hyprctl reload >/dev/null"])
+  }
+
+  FileView {
+    id: hyprFile
+    path: root.hyprPath
+    printErrors: false
+    atomicWrites: true
+    onLoaded: if (root.lastHyprLua === "") root.lastHyprLua = text()
+  }
+
+  // While a hotkey field records, a bind-less submap lets every key reach us.
+  function setRecording(on) {
+    root.recording = on
+    Quickshell.execDetached(["hyprctl", "dispatch", on ? "hl.dsp.submap(\"omacast-record\")"
+      : (root.opened ? "hl.dsp.submap(\"omacast\")" : "hl.dsp.submap(\"reset\")")])
   }
 
   FileView {
@@ -1295,7 +2051,12 @@ Item {
     onFileChanged: reload()
   }
 
-  Component.onCompleted: Quickshell.execDetached(["mkdir", "-p", root.stateDir])
+  Component.onCompleted: {
+    Quickshell.execDetached(["mkdir", "-p", root.stateDir])
+    // Never leave Hyprland stuck in the launcher submap after a shell restart.
+    Quickshell.execDetached(["bash", "-c", "[ \"$(hyprctl submap 2>/dev/null)\" = omacast ] && hyprctl dispatch 'hl.dsp.submap(\"reset\")'"])
+    bindsProc.running = true
+  }
 
   Connections {
     target: DesktopEntries.applications
@@ -1336,6 +2097,7 @@ Item {
   PanelWindow {
     id: panel
     visible: root.opened
+    screen: root.targetScreen
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omacast"
@@ -1464,10 +2226,10 @@ Item {
               radius: 1
             }
             font.family: root.fontFamily
-            font.pixelSize: Math.round(Style.font.heading * 1.18)
+            font.pixelSize: root.fs(Math.round(Style.font.heading * 1.18))
             clip: true
             focus: true
-            readOnly: root.mode === "detail"
+            readOnly: root.mode === "detail" || root.mode === "snippet-edit" || root.mode === "snippet-args"
             onTextEdited: root.setQuery(text)
 
             Text {
@@ -1475,6 +2237,10 @@ Item {
               verticalAlignment: Text.AlignVCenter
               visible: input.text.length === 0
               text: root.mode === "clipboard" ? "Search clipboard history…"
+                : root.mode === "snippets" ? "Search snippets…"
+                : root.mode === "settings" ? "Search settings and commands…"
+                : root.mode === "snippet-edit" ? (root.snippetDraft && root.snippetDraft.index >= 0 ? "Edit Snippet" : "Create Snippet")
+                : root.mode === "snippet-args" ? ((root.snippetPending && root.snippetPending.snippet.name) || "Snippet")
                 : root.mode === "emoji" ? "Search emoji…"
                 : root.mode === "ai" ? (root.conversation.length ? "Ask a follow-up…" : "Ask Claude anything…")
                 : root.mode === "detail" ? root.detailTitle
@@ -1545,25 +2311,27 @@ Item {
           width: parent.width
           height: Style.spacing.hairline
           color: Util.alpha(root.foreground, 0.1)
+          visible: !root.compact
         }
 
         // ------------------------------------------------------ content
         Item {
           id: content
+          visible: !root.compact
           width: parent.width
           height: card.height - root.headerHeight - root.footerHeight - Style.spacing.hairline - card.border.width * 2
 
           // List (search + clipboard)
           ListView {
             id: resultList
-            visible: root.mode === "search" || root.mode === "clipboard"
+            visible: root.mode === "search" || root.mode === "clipboard" || root.mode === "snippets"
             anchors.top: parent.top
             anchors.bottom: parent.bottom
             anchors.left: parent.left
             anchors.topMargin: Style.space(6)
             anchors.bottomMargin: Style.space(6)
             anchors.leftMargin: Style.space(8)
-            width: root.mode === "clipboard" ? Math.round(parent.width * 0.44) : parent.width - Style.space(16)
+            width: (root.mode === "clipboard" || root.mode === "snippets") ? Math.round(parent.width * 0.44) : parent.width - Style.space(16)
             model: root.rows
             clip: true
             spacing: Style.space(2)
@@ -1740,6 +2508,30 @@ Item {
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(8)
 
+                  Repeater {
+                    model: root.mode === "search" ? root.keyParts(root.hotkeyFor(row.modelData)) : []
+                    delegate: Rectangle {
+                      required property var modelData
+                      anchors.verticalCenter: parent.verticalCenter
+                      height: Style.space(20)
+                      width: Math.max(height, capLabel.implicitWidth + Style.space(10))
+                      radius: Style.space(5)
+                      color: Util.alpha(root.foreground, row.selected ? 0.14 : 0.08)
+                      Text {
+                        id: capLabel
+                        anchors.centerIn: parent
+                        text: root.prettyKey(modelData)
+                        color: root.foreground
+                        opacity: row.selected ? 0.85 : 0.6
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption + 1
+                        font.weight: Font.Medium
+                      }
+                    }
+                  }
+
+                  Item { width: Style.space(4); height: 1; visible: root.hotkeyFor(row.modelData) !== "" }
+
                   Rectangle {
                     visible: root.isRunning(row.modelData)
                     anchors.verticalCenter: parent.verticalCenter
@@ -1790,9 +2582,9 @@ Item {
             }
           }
 
-          // Clipboard preview pane
+          // Clipboard / snippet preview pane
           Item {
-            visible: root.mode === "clipboard"
+            visible: root.mode === "clipboard" || root.mode === "snippets"
             anchors.left: resultList.right
             anchors.leftMargin: Style.space(8)
             anchors.right: parent.right
@@ -1814,11 +2606,11 @@ Item {
               clip: true
               contentHeight: clipText.visible ? clipText.implicitHeight : height
               boundsBehavior: Flickable.StopAtBounds
-              visible: !!root.selectedRow && root.selectedRow.kind === "clip"
+              visible: !!root.selectedRow && (root.selectedRow.kind === "clip" || root.selectedRow.kind === "snippet")
 
               Text {
                 id: clipText
-                visible: !!root.selectedRow && root.selectedRow.clipType === "text"
+                visible: !!root.selectedRow && (root.selectedRow.clipType === "text" || root.selectedRow.kind === "snippet")
                 width: parent.width
                 text: visible ? String(root.selectedRow.text).substring(0, 6000) : ""
                 textFormat: Text.PlainText
@@ -1841,12 +2633,253 @@ Item {
 
             Text {
               anchors.centerIn: parent
-              visible: root.rows.length === 0
+              visible: root.mode === "clipboard" && root.rows.length === 0
               text: root.query ? "No matches" : "Clipboard history is empty"
               color: root.foreground
               opacity: 0.45
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
+            }
+          }
+
+          // Settings
+          SettingsView {
+            id: settingsView
+            anchors.fill: parent
+            visible: root.mode === "settings"
+            host: root
+            fontFamily: root.fontFamily
+          }
+
+          // Snippet editor
+          FocusScope {
+            id: snippetForm
+            visible: root.mode === "snippet-edit"
+            anchors.fill: parent
+            anchors.margins: Style.space(20)
+
+            function update(key, value) {
+              if (!root.snippetDraft) return
+              var d = root.snippetDraft
+              d[key] = value
+              root.snippetDraft = d
+            }
+
+            property string error: ""
+
+            function save() {
+              snippetForm.update("name", snippetName.currentText())
+              snippetForm.update("keyword", snippetKeyword.currentText())
+              snippetForm.update("text", snippetText.currentText())
+              var d = root.snippetDraft || {}
+              if (!String(d.name || "").trim()) { snippetForm.error = "Give the snippet a name."; snippetName.focusInput(); return }
+              if (!String(d.text || "").length) { snippetForm.error = "The snippet text is empty."; snippetText.focusInput(); return }
+              var kw = String(d.keyword || "").replace(/\s+/g, "")
+              for (var i = 0; i < root.snippets.length; i++) {
+                if (i !== d.index && kw && root.snippets[i].keyword === kw) {
+                  snippetForm.error = "“" + root.snippets[i].name + "” already uses " + kw + "."
+                  snippetKeyword.focusInput()
+                  return
+                }
+              }
+              snippetForm.error = ""
+              root.saveSnippetDraft()
+            }
+
+            function cancel() {
+              snippetForm.error = ""
+              root.snippetDraft = null
+              root.setMode("snippets")
+            }
+
+            // The editor opens with the cursor in Name; a short delay lets the
+            // view finish switching before focus moves.
+            onVisibleChanged: if (visible) { snippetForm.error = ""; focusTimer.restart() }
+            Timer { id: focusTimer; interval: 60; onTriggered: snippetName.focusInput() }
+
+            Keys.onPressed: function(event) {
+              var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
+              if (event.key === Qt.Key_Escape) {
+                snippetForm.cancel()
+                event.accepted = true
+              } else if (ctrl && (event.key === Qt.Key_S || event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
+                snippetForm.save()
+                event.accepted = true
+              }
+            }
+
+            Column {
+              anchors.fill: parent
+              spacing: Style.space(12)
+
+              Row {
+                width: parent.width
+                spacing: Style.space(12)
+                Text { width: Style.space(80); anchors.verticalCenter: parent.verticalCenter; text: "Name"; color: root.foreground; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.body }
+                TextBox {
+                  id: snippetName
+                  width: parent.width - Style.space(92)
+                  text: root.snippetDraft ? root.snippetDraft.name : ""
+                  placeholder: "Email Signature"
+                  nextField: snippetKeyword
+                  prevField: saveButton
+                  onEdited: function(t) { snippetForm.update("name", t) }
+                  onAccepted: snippetKeyword.focusInput()
+                }
+              }
+              Row {
+                width: parent.width
+                spacing: Style.space(12)
+                Text { width: Style.space(80); anchors.verticalCenter: parent.verticalCenter; text: "Keyword"; color: root.foreground; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.body }
+                TextBox {
+                  id: snippetKeyword
+                  width: Style.space(160)
+                  mono: true
+                  text: root.snippetDraft ? root.snippetDraft.keyword : ""
+                  placeholder: ";sig"
+                  nextField: snippetText
+                  prevField: snippetName
+                  onEdited: function(t) { snippetForm.update("keyword", t) }
+                  onAccepted: snippetText.focusInput()
+                }
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - Style.space(264)
+                  wrapMode: Text.Wrap
+                  text: (root.config.snippetSettings && root.config.snippetSettings.expansion)
+                    ? "Type it in any app to expand the snippet, e.g. ;sig"
+                    : "Keyword expansion is off (Settings › Snippets)."
+                  color: root.foreground
+                  opacity: 0.45
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption + 1
+                }
+              }
+              TextBox {
+                id: snippetText
+                width: parent.width
+                height: parent.height - Style.space(200)
+                nextField: cancelButton
+                prevField: snippetKeyword
+                multiline: true
+                mono: true
+                text: root.snippetDraft ? root.snippetDraft.text : ""
+                placeholder: "Hi {argument name=\"Name\"},\n\n{cursor}\n\nBest,\n{user}"
+                onEdited: function(t) { snippetForm.update("text", t) }
+              }
+              Flow {
+                width: parent.width
+                spacing: Style.space(6)
+                Text { text: "Insert:"; color: root.foreground; opacity: 0.5; font.family: root.fontFamily; font.pixelSize: Style.font.caption + 1; height: Style.space(24); verticalAlignment: Text.AlignVCenter }
+                Repeater {
+                  model: ["{clipboard}", "{date}", "{time}", "{datetime}", "{day}", "{cursor}", "{argument name=\"Name\"}", "{uuid}", "{user}"]
+                  delegate: Rectangle {
+                    required property var modelData
+                    height: Style.space(24)
+                    width: chipText.implicitWidth + Style.space(14)
+                    radius: Style.space(6)
+                    color: chipMouse.containsMouse ? Util.alpha(root.accent, 0.25) : Util.alpha(root.accent, 0.12)
+                    Text { id: chipText; anchors.centerIn: parent; text: modelData; color: root.foreground; font.family: root.monoFamily; font.pixelSize: Style.font.caption }
+                    MouseArea { id: chipMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: snippetText.insertAtCursor(modelData) }
+                  }
+                }
+              }
+              Item {
+                width: parent.width
+                height: Style.space(30)
+                Text {
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - buttons.width - Style.space(12)
+                  elide: Text.ElideRight
+                  text: snippetForm.error || "Tab moves between fields · Alt+Tab inserts a tab · Ctrl+S saves"
+                  color: snippetForm.error ? "#e5484d" : root.foreground
+                  opacity: snippetForm.error ? 1 : 0.4
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption + 1
+                }
+                Row {
+                  id: buttons
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(8)
+                  PillButton {
+                    id: cancelButton
+                    text: "Cancel"
+                    nextField: saveButton
+                    prevField: snippetText
+                    onActivated: snippetForm.cancel()
+                  }
+                  PillButton {
+                    id: saveButton
+                    text: "Save Snippet"
+                    primary: true
+                    nextField: snippetName
+                    prevField: cancelButton
+                    onActivated: snippetForm.save()
+                  }
+                }
+              }
+            }
+          }
+
+          // Snippet arguments, asked before pasting
+          FocusScope {
+            id: argsForm
+            visible: root.mode === "snippet-args"
+            anchors.fill: parent
+            anchors.margins: Style.space(24)
+
+            Keys.onPressed: function(event) {
+              if (event.key === Qt.Key_Escape) { root.snippetPending = null; root.setMode("search"); event.accepted = true }
+              else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.submitSnippetArgs(); event.accepted = true }
+            }
+
+            Column {
+              id: argsRepeater
+              width: parent.width
+              spacing: Style.space(14)
+
+              function focusFirst() {
+                for (var i = 0; i < children.length; i++) {
+                  var c = children[i]
+                  if (c.focusField) { c.focusField(); return }
+                }
+              }
+
+              Text {
+                text: "Fill in the snippet, then press Enter to paste."
+                color: root.foreground
+                opacity: 0.55
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Repeater {
+                model: root.mode === "snippet-args" ? root.snippetArgs : []
+                delegate: Row {
+                  required property var modelData
+                  required property int index
+                  width: argsRepeater.width
+                  spacing: Style.space(12)
+                  function focusField() { if (field.visible) field.focusInput() }
+                  Text { width: Style.space(120); anchors.verticalCenter: parent.verticalCenter; text: modelData.name; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.weight: Font.Medium }
+                  TextBox {
+                    id: field
+                    visible: !modelData.options || modelData.options.length === 0
+                    width: parent.width - Style.space(132)
+                    text: modelData.value
+                    onEdited: function(t) { var a = root.snippetArgs; a[index].value = t; root.snippetArgs = a }
+                    onAccepted: root.submitSnippetArgs()
+                  }
+                  Segmented {
+                    visible: !!modelData.options && modelData.options.length > 0
+                    options: (modelData.options || []).map(function(o) { return { value: o, label: o } })
+                    value: modelData.value
+                    onPicked: function(v) { var a = root.snippetArgs; a[index].value = v; root.snippetArgs = a }
+                  }
+                }
+              }
             }
           }
 
@@ -2033,6 +3066,7 @@ Item {
 
         // ------------------------------------------------------- footer
         Rectangle {
+          visible: !root.compact
           width: parent.width
           height: root.footerHeight
           color: Util.alpha(root.foreground, 0.035)
@@ -2202,7 +3236,7 @@ Item {
               }
 
               Rectangle {
-                visible: index < 2
+                visible: index < 2 || !!modelData.key
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
@@ -2213,7 +3247,7 @@ Item {
                 Text {
                   id: shortcut
                   anchors.centerIn: parent
-                  text: index === 0 ? "↵" : "Ctrl ↵"
+                  text: index === 0 ? "↵" : (index === 1 ? "Ctrl ↵" : (modelData.key || ""))
                   color: root.foreground
                   opacity: 0.75
                   font.family: root.fontFamily
@@ -2262,6 +3296,10 @@ Item {
     if (root.mode === "clipboard") return root.rows.length + " items"
     if (root.mode === "emoji") return root.emojiResults.length + " emoji"
     if (root.mode === "detail") return "Dictionary"
+    if (root.mode === "snippets") return root.snippets.length + " snippets"
+    if (root.mode === "settings") return "Settings"
+    if (root.mode === "snippet-edit") return "Snippet"
+    if (root.mode === "snippet-args") return "Snippet"
     if (root.filesBusy) return "Searching files…"
     return "Omacast"
   }
@@ -2271,9 +3309,13 @@ Item {
     var actions = root.selectedActions
     if (root.mode === "ai") primary = root.aiBusy ? "Answering…" : "Ask"
     else if (actions.length > 0) primary = actions[0].title
+    if (root.mode === "snippet-edit") return [{ label: "Save", keys: ["Ctrl", "S"] }, { label: "Cancel", keys: ["Esc"] }]
+    if (root.mode === "snippet-args") return [{ label: "Paste", keys: ["↵"] }, { label: "Cancel", keys: ["Esc"] }]
+    if (root.mode === "settings") return [{ label: "Back", keys: ["Esc"] }]
     var hints = []
     if (primary) hints.push({ label: primary, keys: root.mode === "ai" && root.aiBusy ? [] : ["↵"] })
     if (actions.length > 0) hints.push({ label: "Actions", keys: ["Ctrl", "K"] })
+    if (root.mode === "snippets") hints.push({ label: "New", keys: ["Ctrl", "N"] })
     if (root.mode === "search" && !root.query) hints.push({ label: "Modes", keys: ["Tab"] })
     return hints
   }
@@ -2291,7 +3333,8 @@ Item {
 
     if (root.actionsOpen) {
       var count = root.selectedActions.length
-      if (key === Qt.Key_Escape || (ctrl && key === Qt.Key_K)) root.actionsOpen = false
+      if (key === Qt.Key_Escape || key === Qt.Key_Left || (ctrl && key === Qt.Key_K)) root.actionsOpen = false
+      else if (key === Qt.Key_Right) { /* already open */ }
       else if (key === Qt.Key_Down || (ctrl && (key === Qt.Key_N || key === Qt.Key_J))) root.actionIndex = (root.actionIndex + 1) % count
       else if (key === Qt.Key_Up || (ctrl && (key === Qt.Key_P || key === Qt.Key_K))) root.actionIndex = (root.actionIndex - 1 + count) % count
       else if (key === Qt.Key_Return || key === Qt.Key_Enter) {
@@ -2303,11 +3346,35 @@ Item {
       return
     }
 
+    if (root.mode === "snippet-edit") {
+      if (key === Qt.Key_Escape) { snippetForm.cancel(); event.accepted = true; return }
+      if (ctrl && (key === Qt.Key_S || key === Qt.Key_Return || key === Qt.Key_Enter)) { snippetForm.save(); event.accepted = true; return }
+      if (key === Qt.Key_Tab) { snippetName.focusInput(); event.accepted = true; return }
+    }
+
+    var closeOnEscape = root.config.general && root.config.general.escapeBehavior === "close"
     if (key === Qt.Key_Escape) {
-      if (root.mode === "detail") root.setMode("search")
+      if (closeOnEscape) root.close()
+      else if (root.mode === "detail") root.setMode("search")
       else if (input.text) { input.text = ""; root.setQuery("") }
       else if (root.mode !== "search") root.setMode("search")
       else root.close()
+      event.accepted = true
+    } else if (ctrl && key === Qt.Key_Comma) {
+      root.setMode("settings")
+      event.accepted = true
+    } else if (root.mode === "settings" && (key === Qt.Key_Up || key === Qt.Key_Down) && !input.text) {
+      settingsView.moveSection(key === Qt.Key_Up ? -1 : 1)
+      event.accepted = true
+    } else if (root.mode === "snippets" && ctrl && key === Qt.Key_N) {
+      root.editSnippet(-1)
+      if (input.text.trim() && root.snippetDraft) { var dn = root.snippetDraft; dn.name = input.text.trim(); root.snippetDraft = dn }
+      event.accepted = true
+    } else if (root.mode === "snippets" && ctrl && key === Qt.Key_E && root.selectedRow && root.selectedRow.kind === "snippet") {
+      root.editSnippet(root.selectedRow.index)
+      event.accepted = true
+    } else if (root.mode === "snippets" && ctrl && (key === Qt.Key_X || key === Qt.Key_Backspace) && root.selectedRow && root.selectedRow.kind === "snippet") {
+      root.perform(root.selectedRow, { op: "snippet-delete", arg: root.selectedRow.index })
       event.accepted = true
     } else if (key === Qt.Key_Tab && !ctrl) {
       root.cycleMode(1)
@@ -2315,8 +3382,19 @@ Item {
     } else if (key === Qt.Key_Backtab) {
       root.cycleMode(-1)
       event.accepted = true
-    } else if (ctrl && key === Qt.Key_K) {
+    } else if ((ctrl && key === Qt.Key_K)
+               || (key === Qt.Key_Right && !ctrl && !shift && root.mode !== "emoji" && root.mode !== "settings"
+                   && input.cursorPosition === input.text.length && root.selectedActions.length > 0)) {
+      // Right arrow at the end of the query opens the actions, like Raycast.
       if (root.selectedActions.length > 0) { root.actionIndex = 0; root.actionsOpen = true }
+      event.accepted = true
+    } else if (ctrl && shift && key === Qt.Key_F && root.selectedRow && root.mode === "search"
+               && ["window", "file", "clip", "fallback", "calc", "header"].indexOf(root.selectedRow.kind) < 0) {
+      root.perform(root.selectedRow, { op: "favorite", arg: root.selectedRow.id })
+      event.accepted = true
+    } else if (ctrl && (event.modifiers & Qt.AltModifier) && (key === Qt.Key_Up || key === Qt.Key_Down)
+               && root.selectedRow && root.isFavorite(root.selectedRow.id)) {
+      root.perform(root.selectedRow, { op: "favorite-move", arg: root.selectedRow.id, arg2: key === Qt.Key_Up ? -1 : 1 })
       event.accepted = true
     } else if (ctrl && key === Qt.Key_N && root.mode === "ai") {
       root.newChat()
