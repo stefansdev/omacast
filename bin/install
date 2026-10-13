@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# Bind Omacast to Super+Space (moving the Omarchy menu to Super+Alt+Space) and
+# put the `omacast` helper on PATH. Safe to run again.
+
+set -euo pipefail
+
+plugin_id="stefans.omacast"
+start_marker="-- omacast:start"
+end_marker="-- omacast:end"
+bindings_file="$HOME/.config/hypr/bindings.lua"
+plugin_dir="$HOME/.config/omarchy/plugins/$plugin_id"
+
+fail() {
+  echo "install: $*" >&2
+  exit 1
+}
+
+for command in omarchy-shell hyprctl jq qalc fd wtype wl-copy; do
+  command -v "$command" >/dev/null 2>&1 || fail "$command is required; no configuration was changed"
+done
+
+[[ -f "$plugin_dir/manifest.json" ]] || fail "install the plugin at $plugin_dir first"
+[[ -f "$bindings_file" ]] || fail "$bindings_file does not exist"
+
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$plugin_dir/bin/omacast" "$HOME/.local/bin/omacast"
+
+if [[ ! -f "$HOME/.config/omacast/config.jsonc" ]]; then
+  mkdir -p "$HOME/.config/omacast"
+  cp "$plugin_dir/config.default.jsonc" "$HOME/.config/omacast/config.jsonc"
+fi
+
+start_count=$(grep -Fxc -- "$start_marker" "$bindings_file" || true)
+end_count=$(grep -Fxc -- "$end_marker" "$bindings_file" || true)
+if (( start_count == 1 && end_count == 1 )); then
+  echo "Omacast is already bound."
+  exit 0
+fi
+(( start_count == 0 && end_count == 0 )) || fail "found an incomplete omacast marker block in $bindings_file"
+
+backup="$bindings_file.omacast.bak.$(date -u +%Y%m%d%H%M%S)"
+cp -p -- "$bindings_file" "$backup"
+
+cat >>"$bindings_file" <<'LUA'
+
+-- omacast:start
+-- Omacast launcher on Super+Space; the Omarchy menu moves to Super+Alt+Space.
+hl.unbind("SUPER + SPACE")
+hl.unbind("SUPER + ALT + SPACE")
+o.bind("SUPER + SPACE", "Omacast", "omarchy-shell shell toggle stefans.omacast '{}'")
+o.bind("SUPER + ALT + SPACE", "Omarchy menu", "omarchy-menu toggle root")
+-- omacast:end
+LUA
+
+hyprctl reload >/dev/null 2>&1 || true
+sleep 0.5
+errors=$(hyprctl configerrors 2>/dev/null | grep -v '^\s*$' || true)
+if [[ -n $errors && $errors != *"no errors"* ]]; then
+  cp -p -- "$backup" "$bindings_file"
+  hyprctl reload >/dev/null 2>&1 || true
+  fail "Hyprland reported config errors, restored $bindings_file:\n$errors"
+fi
+
+echo "Omacast bound to Super+Space (Omarchy menu: Super+Alt+Space). Backup: $backup"

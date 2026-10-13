@@ -1,0 +1,53 @@
+#!/bin/bash
+
+# Ask the Claude CLI a quick question and stream the answer as stream-json.
+#
+#   omacast-ai [--model <model>] [--resume <session-id>] <prompt>
+#
+# Runs from an empty working directory so no project instructions leak in, and
+# with tools disabled so it only ever answers.
+
+set -uo pipefail
+
+model="haiku"
+resume=""
+while (( $# > 1 )); do
+  case "$1" in
+  --model) model="$2"; shift 2 ;;
+  --resume) resume="$2"; shift 2 ;;
+  *) break ;;
+  esac
+done
+
+prompt="${1:-}"
+[[ -n $prompt ]] || exit 1
+
+# The shell is started by Hyprland, so user tool paths may be missing.
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+
+# Prefer the native install; version-manager shims can print status lines.
+claude_bin=""
+for candidate in "$HOME/.local/bin/claude" "$(command -v claude 2>/dev/null)"; do
+  [[ -n $candidate && -x $candidate ]] && { claude_bin="$candidate"; break; }
+done
+if [[ -z $claude_bin ]]; then
+  printf '{"type":"error","message":"The claude CLI was not found. Install Claude Code, or turn Quick AI off with \"ai\": { \"enabled\": false } in ~/.config/omacast/config.jsonc."}\n'
+  exit 1
+fi
+
+workdir="${XDG_RUNTIME_DIR:-/tmp}/omacast-ai"
+mkdir -p "$workdir"
+cd "$workdir" || exit 1
+
+args=(
+  -p
+  --model "$model"
+  --tools ""
+  --output-format stream-json
+  --include-partial-messages
+  --verbose
+  --append-system-prompt "You are answering inside a desktop launcher. Be concise and direct. Use short Markdown when it helps; no preamble."
+)
+[[ -n $resume ]] && args+=(--resume "$resume")
+
+exec "$claude_bin" "${args[@]}" "$prompt"

@@ -1,0 +1,50 @@
+#!/bin/bash
+
+# Expand Omacast placeholders in a text, then paste it into the focused app
+# (or only copy it with --copy-only).
+#
+#   omacast-paste [--copy-only] <text>
+#
+# Placeholders: {clipboard} {date} {time} {datetime} {weekday} {uuid} {user}
+
+set -uo pipefail
+
+copy_only=0
+if [[ ${1:-} == "--copy-only" ]]; then
+  copy_only=1
+  shift
+fi
+
+text="${1:-}"
+[[ -n $text ]] || exit 0
+
+expand() {
+  local value="$1"
+  if [[ $value == *"{clipboard}"* ]]; then
+    local clip
+    clip=$(wl-paste --no-newline 2>/dev/null || true)
+    value=${value//\{clipboard\}/$clip}
+  fi
+  value=${value//\{date\}/$(date +%F)}
+  value=${value//\{time\}/$(date +%H:%M)}
+  value=${value//\{datetime\}/$(date '+%F %H:%M')}
+  value=${value//\{weekday\}/$(date +%A)}
+  value=${value//\{user\}/${USER:-$(id -un)}}
+  if [[ $value == *"{uuid}"* ]]; then
+    value=${value//\{uuid\}/$(cat /proc/sys/kernel/random/uuid)}
+  fi
+  printf '%s' "$value"
+}
+
+expanded=$(expand "$text")
+
+if (( copy_only )); then
+  printf '%s' "$expanded" | wl-copy --type text/plain
+  exit 0
+fi
+
+# Give the launcher time to close and focus to return to the previous window.
+sleep 0.12
+printf '%s' "$expanded" | wl-copy --type text/plain
+sleep 0.08
+wtype -M shift -k Insert -m shift 2>/dev/null || true

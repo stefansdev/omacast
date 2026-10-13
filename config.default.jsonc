@@ -1,0 +1,47 @@
+{
+  // Omacast configuration. Copy to ~/.config/omacast/config.jsonc and edit;
+  // changes are picked up live. Icons are Nerd Font glyphs.
+
+  // Quicklinks: type the keyword followed by text, e.g. "gh quickshell".
+  // {query} is replaced with the URL-encoded text, {clipboard} and {date} also work.
+  "quicklinks": [
+    { "name": "Search Google", "keyword": "g", "icon": "", "url": "https://www.google.com/search?q={query}" },
+    { "name": "Search DuckDuckGo", "keyword": "ddg", "icon": "󰇥", "url": "https://duckduckgo.com/?q={query}" },
+    { "name": "Search GitHub", "keyword": "gh", "icon": "", "url": "https://github.com/search?q={query}&type=repositories" },
+    { "name": "Search YouTube", "keyword": "yt", "icon": "", "url": "https://www.youtube.com/results?search_query={query}" },
+    { "name": "Arch Wiki", "keyword": "aw", "icon": "󰣇", "url": "https://wiki.archlinux.org/index.php?search={query}" },
+    { "name": "Arch User Repository", "keyword": "aur", "icon": "󰣇", "url": "https://aur.archlinux.org/packages?K={query}" },
+    { "name": "Google Maps", "keyword": "maps", "icon": "󰍎", "url": "https://www.google.com/maps/search/{query}" },
+    { "name": "Translate", "keyword": "tr", "icon": "󰗊", "url": "https://translate.google.com/?sl=auto&tl=en&text={query}" },
+    { "name": "Omarchy Manual", "keyword": "omarchy", "icon": "", "url": "https://learn.omacom.io/2/the-omarchy-manual" }
+  ],
+
+  // Snippets: Enter pastes the text into the app you were using.
+  // Placeholders: {clipboard} {date} {time} {datetime} {weekday} {uuid} {user}
+  "snippets": [
+    { "name": "Today's date", "keyword": "date", "text": "{date}" },
+    { "name": "Timestamp", "keyword": "now", "text": "{datetime}" },
+    { "name": "Shrug", "keyword": "shrug", "text": "¯\\_(ツ)_/¯" }
+  ],
+
+  // Custom commands. Set "terminal": true to run in a terminal window.
+  "commands": [
+    { "name": "Edit Omacast Config", "icon": "", "command": "omarchy-launch-editor ~/.config/omacast/config.jsonc" },
+    { "name": "Hyprland Config", "icon": "", "command": "omarchy-launch-editor ~/.config/hypr/hyprland.lua" },
+    { "name": "System Monitor", "icon": "󰍛", "command": "btop", "terminal": true },
+    { "name": "Update Omarchy", "icon": "", "command": "omarchy update", "terminal": true }
+  ],
+
+  // Apps pinned to the top of the empty palette (desktop file ids).
+  "favorites": [],
+
+  // Where file search looks, and where notes live.
+  "files": { "roots": ["~"], "maxResults": 12 },
+  "notes": { "dir": "~/notes" },
+
+  // Quick AI uses the Claude Code CLI with your existing login.
+  "ai": { "enabled": true, "model": "haiku" },
+
+  // Fallback web search used for "Search the web" rows.
+  "search": { "url": "https://www.google.com/search?q={query}" }
+}

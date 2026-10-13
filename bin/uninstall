@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Remove the Omacast keybinding block and helper link. Leaves your
+# ~/.config/omacast config and usage history in place.
+
+set -euo pipefail
+
+bindings_file="$HOME/.config/hypr/bindings.lua"
+
+if [[ -f $bindings_file ]] && grep -Fxq -- "-- omacast:start" "$bindings_file"; then
+  cp -p -- "$bindings_file" "$bindings_file.omacast-uninstall.bak.$(date -u +%Y%m%d%H%M%S)"
+  sed -i '/^-- omacast:start$/,/^-- omacast:end$/d' "$bindings_file"
+  # Drop the blank line the installer added before the block.
+  sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$bindings_file"
+  hyprctl reload >/dev/null 2>&1 || true
+  echo "Removed the Omacast keybindings; Super+Space opens the Omarchy menu again."
+fi
+
+if [[ -L "$HOME/.local/bin/omacast" ]]; then
+  rm -f "$HOME/.local/bin/omacast"
+fi

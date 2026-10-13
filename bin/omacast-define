@@ -1,0 +1,33 @@
+#!/bin/bash
+
+# Look up an English word with the free dictionaryapi.dev service and print
+# the definition as Markdown.
+#
+#   omacast-define <word>
+
+set -uo pipefail
+
+word="${1:-}"
+[[ -n $word ]] || exit 1
+
+encoded=$(jq -rn --arg w "$word" '$w | @uri')
+json=$(curl -fsS --max-time 6 "https://api.dictionaryapi.dev/api/v2/entries/en/$encoded" 2>/dev/null)
+
+if [[ -z $json ]] || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$json"; then
+  printf '### %s\n\nNo definition found.\n' "$word"
+  exit 0
+fi
+
+jq -r '
+  .[0] as $e |
+  "## \($e.word)" +
+  (([$e.phonetics[]?.text // empty] | first) as $p | if $p then "  `\($p)`" else "" end) +
+  "\n\n" +
+  ([ .[].meanings[] |
+     "**\(.partOfSpeech)**\n\n" +
+     ([ .definitions[:4][] |
+        "- \(.definition)" + (if .example then "\n  *“\(.example)”*" else "" end)
+      ] | join("\n")) +
+     (if (.synonyms | length) > 0 then "\n\n*Synonyms:* \(.synonyms[:6] | join(", "))" else "" end)
+   ] | join("\n\n"))
+' <<<"$json"

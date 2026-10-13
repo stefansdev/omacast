@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Toggle the Omacast launcher, optionally straight into a mode.
+#
+#   omacast [search|clipboard|emoji|ai] [query]
+#   omacast run <row-id>      run a result without showing the palette
+
+set -euo pipefail
+
+if [[ ${1:-} == "run" ]]; then
+  exec omarchy-shell shell call stefans.omacast run "${2:?row id required}"
+fi
+
+mode="${1:-search}"
+query="${2:-}"
+payload=$(jq -nc --arg mode "$mode" --arg query "$query" '{mode: $mode, query: $query}')
+exec omarchy-shell shell toggle stefans.omacast "$payload"

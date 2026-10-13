@@ -1,0 +1,134 @@
+#!/bin/bash
+
+# Rectangle-style window management for Hyprland, used by Omacast.
+#
+#   omacast-window <action> [address] [argument]
+#
+# Layout actions float the window and place it inside the usable area of its
+# monitor (bar and other reserved space excluded). Without an address the
+# active window is used.
+
+set -uo pipefail
+
+action="${1:-}"
+address="${2:-}"
+argument="${3:-}"
+
+[[ -n $action ]] || { echo "usage: omacast-window <action> [address] [argument]" >&2; exit 1; }
+
+dispatch() {
+  hyprctl dispatch "$1" >/dev/null 2>&1
+}
+
+if [[ -z $address ]]; then
+  address=$(hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty')
+fi
+[[ -n $address && $address != "null" ]] || exit 0
+
+client=$(hyprctl clients -j 2>/dev/null | jq -c --arg a "$address" 'first(.[] | select(.address == $a)) // empty')
+[[ -n $client ]] || exit 0
+
+window="address:$address"
+floating=$(jq -r '.floating' <<<"$client")
+monitor_id=$(jq -r '.monitor' <<<"$client")
+class=$(jq -r '.class' <<<"$client")
+
+monitor=$(hyprctl monitors -j 2>/dev/null | jq -c --argjson id "$monitor_id" 'first(.[] | select(.id == $id)) // first(.[])')
+read -r mx my mw mh rl rt rr rb < <(jq -r '
+  ((.transform // 0) % 2 == 1) as $rot |
+  [ .x, .y,
+    (((if $rot then .height else .width end) / .scale) | floor),
+    (((if $rot then .width else .height end) / .scale) | floor),
+    (.reserved[0] // 0), (.reserved[1] // 0), (.reserved[2] // 0), (.reserved[3] // 0)
+  ] | @tsv' <<<"$monitor")
+
+gap=$(hyprctl getoption general:gaps_out -j 2>/dev/null | jq -r '(.css // "8") | split(" ")[0] | tonumber? // 8')
+[[ $gap =~ ^[0-9]+$ ]] || gap=8
+
+# Usable area, inset by the outer gap.
+ax=$((mx + rl + gap))
+ay=$((my + rt + gap))
+aw=$((mw - rl - rr - gap * 2))
+ah=$((mh - rt - rb - gap * 2))
+half_gap=$((gap / 2))
+
+ensure_floating() {
+  [[ $floating == "true" ]] || dispatch "hl.dsp.window.float({ window = \"$window\", action = \"toggle\" })"
+}
+
+# place <x-fraction-num> <x-den> <y-num> <y-den> <w-num> <w-den> <h-num> <h-den>
+# Positions are fractions of the usable area; inner edges get half a gap so
+# neighbouring windows keep the same spacing as tiled ones.
+place() {
+  local x=$((ax + aw * $1 / $2)) y=$((ay + ah * $3 / $4))
+  local w=$((aw * $5 / $6)) h=$((ah * $7 / $8))
+
+  if (( $1 > 0 )); then x=$((x + half_gap)); w=$((w - half_gap)); fi
+  if (( $1 * $6 + $5 * $2 < $2 * $6 )); then w=$((w - half_gap)); fi
+  if (( $3 > 0 )); then y=$((y + half_gap)); h=$((h - half_gap)); fi
+  if (( $3 * $8 + $7 * $4 < $4 * $8 )); then h=$((h - half_gap)); fi
+
+  ensure_floating
+  dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })"
+  dispatch "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })"
+}
+
+center_size() {
+  local w=$1 h=$2
+  ensure_floating
+  dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })"
+  dispatch "hl.dsp.window.move({ window = \"$window\", x = $((ax + (aw - w) / 2)), y = $((ay + (ah - h) / 2)) })"
+}
+
+case $action in
+left-half) place 0 1 0 1 1 2 1 1 ;;
+right-half) place 1 2 0 1 1 2 1 1 ;;
+top-half) place 0 1 0 1 1 1 1 2 ;;
+bottom-half) place 0 1 1 2 1 1 1 2 ;;
+top-left) place 0 1 0 1 1 2 1 2 ;;
+top-right) place 1 2 0 1 1 2 1 2 ;;
+bottom-left) place 0 1 1 2 1 2 1 2 ;;
+bottom-right) place 1 2 1 2 1 2 1 2 ;;
+first-third) place 0 1 0 1 1 3 1 1 ;;
+center-third) place 1 3 0 1 1 3 1 1 ;;
+last-third) place 2 3 0 1 1 3 1 1 ;;
+first-two-thirds) place 0 1 0 1 2 3 1 1 ;;
+last-two-thirds) place 1 3 0 1 2 3 1 1 ;;
+maximize) place 0 1 0 1 1 1 1 1 ;;
+almost-maximize) center_size $((aw * 9 / 10)) $((ah * 9 / 10)) ;;
+reasonable-size) center_size $((aw * 3 / 5)) $((ah * 7 / 10)) ;;
+center-half) center_size $((aw / 2)) "$ah" ;;
+center)
+  ensure_floating
+  dispatch "hl.dsp.window.center({ window = \"$window\" })"
+  ;;
+fullscreen) dispatch "hl.dsp.window.fullscreen({ window = \"$window\", mode = \"fullscreen\" })" ;;
+float) dispatch "hl.dsp.window.float({ window = \"$window\", action = \"toggle\" })" ;;
+tile)
+  [[ $floating == "true" ]] && dispatch "hl.dsp.window.float({ window = \"$window\", action = \"toggle\" })"
+  ;;
+pin)
+  ensure_floating
+  dispatch "hl.dsp.window.pin({ window = \"$window\" })"
+  ;;
+workspace)
+  [[ $argument =~ ^[0-9]+$ ]] || exit 1
+  dispatch "hl.dsp.window.move({ window = \"$window\", workspace = \"$argument\" })"
+  ;;
+next-display) dispatch "hl.dsp.window.move({ window = \"$window\", monitor = \"+1\" })" ;;
+bring-here)
+  workspace=$(hyprctl activeworkspace -j | jq -r '.id')
+  dispatch "hl.dsp.window.move({ window = \"$window\", workspace = \"$workspace\" })"
+  dispatch "hl.dsp.focus({ window = \"$window\" })"
+  ;;
+focus) dispatch "hl.dsp.focus({ window = \"$window\" })" ;;
+close) dispatch "hl.dsp.window.close({ window = \"$window\" })" ;;
+quit-app)
+  hyprctl clients -j | jq -r --arg c "$class" '.[] | select(.class == $c) | .address' |
+    while read -r a; do dispatch "hl.dsp.window.close({ window = \"address:$a\" })"; done
+  ;;
+*)
+  echo "omacast-window: unknown action $action" >&2
+  exit 1
+  ;;
+esac
